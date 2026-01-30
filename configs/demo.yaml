@@ -1,0 +1,16 @@
+seed: 0
+
+data:
+  name: toy_domains
+  params:
+    n: 50
+
+shift_metrics:
+  - name: token_jsd
+  - name: oov_rate
+
+adapter:
+  name: no_adapt
+
+report:
+  out_dir: runs

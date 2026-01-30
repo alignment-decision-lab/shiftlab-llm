@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/shiftlab/__init__.py
+src/shiftlab/cli.py
+src/shiftlab.egg-info/PKG-INFO
+src/shiftlab.egg-info/SOURCES.txt
+src/shiftlab.egg-info/dependency_links.txt
+src/shiftlab.egg-info/requires.txt
+src/shiftlab.egg-info/top_level.txt
+src/shiftlab/adapt/adapters.py
+src/shiftlab/core/registry.py
+src/shiftlab/core/types.py
+src/shiftlab/data/toy_domains.py
+src/shiftlab/eval/runner.py
+src/shiftlab/shift/metrics.py
