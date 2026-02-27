@@ -2,15 +2,20 @@ seed: 0
 
 data:
   name: toy_domains
+  params: {}
+
+shift_operator:
+  name: inject_punct
   params:
-    n: 50
+    p: 0.3
 
 shift_metrics:
   - name: token_jsd
   - name: oov_rate
 
 adapter:
-  name: no_adapt
+  name: normalize_punct
+  params: {}
 
 report:
-  out_dir: runs
+  out_dir: null

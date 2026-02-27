@@ -1,18 +1,72 @@
-# shiftlab-llm
+## shiftlab-llm
 
-Research toolkit for diagnosing **domain shift** and testing lightweight **adaptation** strategies for LLM pipelines.
+Experimental framework for studying structural perturbations and correction mechanisms in LLM-based decision pipelines.
 
-Shift-Lab overview diagram showing a pipeline with domain shift detection and LLM adaptation strategies, including input data transformation, model processing, and output evaluation stages.
-
+SHIFT-Lab is not a generic robustness benchmark.
+It is an experimental instrument for analyzing how structured shifts affect decision quality and constraint satisfaction, and how lightweight correction modules restore performance.
 <p align="center">
-  <img src="docs/figures/general-schema.png" alt="SHIFT-Lab overview" width="700">
+  <img src="docs/figures/general-schema-better.png" alt="SHIFT-Lab overview" width="700">
 </p>
 
-**SHIFT-Lab** is a research framework for studying **distribution shift in decision and optimization pipelines**.
-The project provides controlled data-shift generators, standardized evaluation protocols, and quantitative metrics to measure how performance and constraint satisfaction degrade under shift. It also supports lightweight **adaptation methods** (e.g., reweighting, recalibration, partial fine-tuning) to study which strategies recover robustness without full retraining.
-The goal is to **understand what breaks under shift, why it breaks, and what minimal fixes work**, in a reproducible and extensible benchmark.
+## Core Idea
+
+Modern LLM pipelines are deployed under changing conditions:
+- Input distribution shifts
+- Noise and format drift
+- Constraint modifications (budgets, penalties, priorities)
+- Calibration drift
+
+SHIFT-Lab makes these perturbations explicit and measurable.
+
+The framework separates three components:
+
+1. **Shift Operators**
+
+Structural perturbations applied to a domain (data shift, constraint shift, etc.).
+
+2. **Correction Modules**
+
+Lightweight adaptation layers (normalization, recalibration, low-cost adapters).
+
+3. **Metrics**
+
+Quantify degradation and recovery:
+- Distribution divergence (e.g., token JSD)
+- Constraint violation rate
+- Entropy-based uncertainty proxy
+
+The objective is to study:
+- What breaks under structural perturbation?
+- How sensitive is decision quality to constraint shifts?
+- Which minimal correction mechanisms recover stability?
+
+## Architecture
+
+The pipeline follows:
+Domain → Shift Operator → Correction Module → Evaluation Metrics
+
+All components are modular and registered:
+- `shift/` : data and constraint perturbations
+- `adapt/` :correction modules
+- `eval/` : evaluation and reporting
+- `core/` : registries and typed interfaces
 
 ## Quickstart
-```bash
+```
 pip install -e .
 python -m shiftlab.cli run --config configs/demo.yaml
+```
+
+Constraint shift example:
+```
+python -m shiftlab.cli run \
+  --config configs/demo_constraints_no_adapt.yaml
+```
+
+## Research Positioning
+
+SHIFT-Lab focuses on:
+- Structural robustness under constraint perturbations
+- Correction under distribution and budget shifts
+- Calibration and uncertainty proxies without labels
+- Lightweight adaptation instead of full retraining

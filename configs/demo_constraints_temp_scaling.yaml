@@ -1,0 +1,27 @@
+seed: 0
+
+data:
+  name: toy_domains
+  params:
+    n: 50
+
+shift_operator:
+  name: tighten_budget
+  params:
+    factor: 0.8
+
+adapter:
+  name: temperature_scaling
+  params:
+    T: 1.2
+
+shift_metrics:
+  - name: token_jsd
+  - name: oov_rate
+  - name: constraint_violation_rate
+    params:
+      c: 100.0
+  - name: entropy_mean
+
+report:
+  out_dir: runs/demo_constraints
