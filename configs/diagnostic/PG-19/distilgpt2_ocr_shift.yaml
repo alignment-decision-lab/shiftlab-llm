@@ -1,0 +1,68 @@
+models:
+  name: "distilgpt2"
+
+dataset:
+  type: "pg19"
+  name: "emozilla/pg19"
+  split: "train"
+  text_column: "text"
+  streaming: false
+
+training:
+  epochs: 6
+  batch_size: 16
+  learning_rate: 0.00005
+  weight_decay: 0.0
+  context_length: 64
+  val_split_ratio: 0.1
+  seed: 42
+
+  gamma: 0.7
+  rho: 0.0
+
+methods:
+  ERM:
+    type: "ERM"
+
+  lambda_small:
+    type: "KL_DRO"
+    lambda: 0.2
+
+  lambda_medium:
+    type: "KL_DRO"
+    lambda: 1.0
+
+  lambda_large:
+    type: "KL_DRO"
+    lambda: 5.0
+
+diagnostic:
+  total_size: 20000
+
+  train_pool_size: 12000
+  test_pool_size: 6000
+
+  alpha_easy: 0.3
+  alpha_hard: 0.3
+
+  train_alpha: 0.4
+  train_beta: 0.4
+  train_size: 8000
+
+  test_size: 2000
+
+  close_noise: 0.01
+  mid_noise: 0.05
+  far_noise: 0.10
+
+  alpha_k: [0.7, 0.33, 0.1]
+  beta_k: [0.2, 0.34, 0.2]
+  scenario_names:
+    - "mostly_close"
+    - "balanced"
+    - "mostly_far"
+
+  evaluation_seeds: [42, 123, 999, 2024, 3407]
+
+outputs:
+  dir: "outputs/diagnostic/pg19_ocr_shift/distilgpt2"

@@ -1,0 +1,34 @@
+models:
+  name: "distilgpt2"
+
+dataset:
+  type: "pg19"
+  name: "emozilla/pg19"
+  split: "train"
+  text_column: "text"
+  streaming: false
+
+training:
+  epochs: 3
+  batch_size: 16
+  learning_rate: 0.00005
+  weight_decay: 0.0
+  context_length: 64
+  val_split_ratio: 0.1
+  seed: 42
+
+  gamma: 0.7
+  rho: 0.0
+
+diagnostic:
+  total_size: 18000
+
+  train_pool_size: 12000
+  test_pool_size: 6000
+
+  lambda_max: 0.1
+  epsilon: 0.02
+
+
+outputs:
+  dir: "outputs/diagnostic/lambda_analysis_jump/distilgpt2"

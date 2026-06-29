@@ -1,0 +1,32 @@
+models:
+  name: gpt2-medium
+
+dataset:
+  name: "OpenLLM-France/wikisource"
+  config: null
+  format: "text"
+  text_column: "text"
+  split: "train"
+  cleaning: "wikisource"
+
+training:
+  epochs: 10
+  batch_size: 4
+  learning_rate: 0.000005
+  dataset_size: 20000
+  val_split_ratio: 0.1
+  max_length: 64
+  seed: 42
+
+diagnostic:
+  alpha: 0.2
+  beta_train: 0.1
+  betas_test: [0.0, 0.1, 0.3, 0.5, 0.8, 1.0]
+  histogram_betas: [0, 0.5, 1]
+  train_size: 6000
+  test_size: 2000
+  severity_name: "Hard ratio"
+  severity_symbol: "β"
+  
+outputs:
+  dir: "outputs/diagnostic/easy_hard_wikisource/gpt2_medium"

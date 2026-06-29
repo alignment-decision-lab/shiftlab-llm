@@ -1,0 +1,75 @@
+models:
+  name: "distilgpt2"
+
+dataset:
+  type: "pg19"
+  name: "emozilla/pg19"
+  split: "train"
+  text_column: "text"
+  streaming: true
+  cleaning: "basic"
+
+training:
+  epochs: 8 #6
+  batch_size: 16
+  learning_rate: 0.00003
+  weight_decay: 0.0
+  dataset_size: 7000 #4500
+  val_split_ratio: 0.1
+  context_length: 64
+  seed: 42
+
+  gamma: 0.5
+  rho: 0.1
+
+  lambdas:
+    small: 0.2 #0.5 #0.2
+    medium: 1.0 #2.0 #1.0
+    large: 5.0 
+
+diagnostic:
+  train_pool_size: 6000 #4000
+  test_pool_size: 1000 #500   # this is D_close from PG-19 held-out
+
+  alpha_easy: 0.4
+  alpha_hard: 0.2
+
+  alpha_train: 0.4 #0.7 #0.4
+  beta_train: 0.4 #0.2 #0.4
+  train_size: 3000 #2000
+
+  scenario_names:
+    - "mostly_close"
+    - "balanced"
+    - "mostly_far"
+
+  alpha_k:
+    - 0.85
+    - 0.34
+    - 0.05
+
+  beta_k:
+    - 0.10
+    - 0.33
+    - 0.15
+
+  test_size: 800 #500
+
+  mid_dataset:
+    type: "wikitext"
+    name: "wikitext"
+    config: "wikitext-2-raw-v1"
+    split: "train"
+    text_column: "text"
+
+  far_dataset:
+    type: "gallica"
+    name: "PleIAs/Post-OCR-Correction"
+    config: "french"
+    split: "train"
+    text_column: "text"
+    streaming: true
+    cleaning: "basic"
+
+outputs:
+  dir: "outputs/kl_dro_phase2/pg19_wikitext_gallica/distilgpt2"

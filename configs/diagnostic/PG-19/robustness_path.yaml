@@ -1,0 +1,52 @@
+models:
+  name: "distilgpt2"
+
+dataset:
+  type: "pg19"
+  name: "emozilla/pg19"
+  split: "train"
+  text_column: "text"
+  streaming: false
+
+training:
+  epochs: 3
+  batch_size: 16
+  learning_rate: 0.00005
+  weight_decay: 0.0
+  context_length: 64
+  val_split_ratio: 0.1
+  seed: 42
+
+  gamma: 0.7
+  rho: 0.0
+
+experiment:
+  probe_seeds:
+    - 42
+    - 123
+    - 2026
+    - 7
+    - 999
+  probe_size: 300
+
+diagnostic:
+  total_size: 18000
+
+  train_pool_size: 12000
+  test_pool_size: 6000
+
+interpolation:
+  beta: 0.5
+
+  lambdas_beta:
+    - 0.25
+    - 0.5
+    - 0.75
+
+  interval_widths:
+    - 0.05
+    - 0.1
+    - 0.2
+
+outputs:
+  dir: "outputs/diagnostic/robustness_path/distilgpt2"
