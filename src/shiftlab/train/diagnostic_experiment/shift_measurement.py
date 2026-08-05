@@ -1,5 +1,5 @@
 from shiftlab.data.load_datasets import load_dataset_from_config
-import utils
+from shiftlab.train.diagnostic_experiment import utils
 import argparse
 import yaml
 import torch
@@ -173,6 +173,52 @@ def compute_token_kl_batch_vs_dataloader(batch, dataloader, vocab_size, epsilon=
 
     return kl
 
+
+def compute_dataset_token_distribution_with_budget(
+    dataloader,
+    vocab_size,
+    max_tokens,
+    epsilon=1e-8,
+):
+    """
+    Compute a token distribution using exactly max_tokens valid tokens.
+    Padding tokens are ignored.
+    """
+    counts = torch.zeros(vocab_size, dtype=torch.float64)
+    total_tokens = 0
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+
+        valid_tokens = input_ids[attention_mask == 1].reshape(-1).cpu()
+
+        remaining_tokens = max_tokens - total_tokens
+
+        if remaining_tokens <= 0:
+            break
+
+        # Use only the number of tokens still needed.
+        valid_tokens = valid_tokens[:remaining_tokens]
+
+        counts += torch.bincount(
+            valid_tokens,
+            minlength=vocab_size,
+        ).to(torch.float64)
+
+        total_tokens += valid_tokens.numel()
+
+    if total_tokens < max_tokens:
+        raise ValueError(
+            f"Only {total_tokens:,} valid tokens were available, "
+            f"but {max_tokens:,} were requested."
+        )
+
+    counts += epsilon
+    distribution = counts / counts.sum()
+
+    return distribution, total_tokens
+
 # - Embedding KL - 
 
 def compute_valid_hidden_states(batch, model, device):
@@ -313,15 +359,30 @@ def compute_diag_gaussian_kl_batch_vs_dataloader(
 # PCA Gaussian KL
 
 def fit_pca(embeddings, n_components):
+    max_components = min(
+        embeddings.shape[0] - 1,
+        embeddings.shape[1],
+    )
+
+    n_components = min(
+        int(n_components),
+        int(max_components),
+    )
+
+    if n_components < 1:
+        raise ValueError(
+            "Not enough embeddings to fit PCA."
+        )
+
     pca_mean = embeddings.mean(dim=0)
+    x_centered = embeddings - pca_mean
 
-    X_centered = embeddings - pca_mean
+    _, _, components = torch.pca_lowrank(
+        x_centered,
+        q=n_components,
+    )
 
-    U, S, V = torch.pca_lowrank(X_centered, q=n_components)
-
-    pca_components = V[:, :n_components]
-
-    return pca_mean, pca_components
+    return pca_mean, components[:, :n_components]
 
 def project_pca(embeddings, pca_mean, pca_components):
     return (embeddings - pca_mean) @ pca_components
@@ -425,6 +486,372 @@ def compute_pca_gaussian_kl_batch_vs_dataloader(
         n_components=n_components,
         epsilon=epsilon
     )
+
+def compute_dataset_shift_statistics(
+    dataloader,
+    model,
+    device,
+    vocab_size,
+    max_embedding_tokens=20000,
+    token_distribution_max_tokens=500_000,
+    token_distribution=None,
+    token_epsilon=1e-8,
+    gaussian_epsilon=1e-5,
+):
+    """
+    Compute reusable token and embedding statistics for one dataset.
+
+    If token_distribution is provided, it is reused directly.
+    This is used for source datasets whose official distributions
+    were already computed by models_bank.py.
+
+    Otherwise, a new distribution is computed from exactly
+    token_distribution_max_tokens valid tokens.
+    """
+
+    if token_distribution is None:
+        token_distribution, n_tokens_used = (
+            compute_dataset_token_distribution_with_budget(
+                dataloader=dataloader,
+                vocab_size=vocab_size,
+                max_tokens=token_distribution_max_tokens,
+                epsilon=token_epsilon,
+            )
+        )
+
+        if n_tokens_used != token_distribution_max_tokens:
+            raise RuntimeError(
+                f"{n_tokens_used} tokens used instead of "
+                f"{token_distribution_max_tokens}."
+            )
+
+        token_distribution = token_distribution.cpu()
+
+    else:
+        token_distribution = (
+            torch.as_tensor(token_distribution)
+            .detach()
+            .cpu()
+            .to(torch.float64)
+        )
+
+        if token_distribution.numel() != vocab_size:
+            raise ValueError(
+                "The provided token distribution has "
+                f"{token_distribution.numel()} entries, "
+                f"but vocab_size={vocab_size}."
+            )
+
+        token_distribution = (
+            token_distribution
+            / token_distribution.sum()
+        )
+
+    embeddings = compute_dataloader_hidden_states(
+        dataloader=dataloader,
+        model=model,
+        device=device,
+        max_tokens=max_embedding_tokens,
+    ).float().cpu()
+
+    embedding_mean = embeddings.mean(dim=0)
+
+    diag_mean, diag_var = compute_diag_gaussian_stats(
+        embeddings,
+        epsilon=gaussian_epsilon,
+    )
+
+    return {
+        "token_distribution": token_distribution,
+        "embeddings": embeddings,
+        "embedding_mean": embedding_mean,
+        "diag_mean": diag_mean,
+        "diag_var": diag_var,
+        "num_embedding_tokens": int(
+            embeddings.shape[0]
+        ),
+    }
+
+def precompute_all_dataset_statistics(
+    dataset_dataloaders,
+    model,
+    device,
+    vocab_size,
+    source_token_distributions=None,
+    token_distribution_max_tokens=500_000,
+    max_embedding_tokens=20000,
+    token_epsilon=1e-8,
+    gaussian_epsilon=1e-5,
+):
+    """
+    Precompute shift statistics for all source and deployment datasets.
+
+    Source datasets reuse the official token distributions produced
+    by models_bank.py. Deployment distributions are computed using
+    a fixed token budget.
+    """
+
+    if source_token_distributions is None:
+        source_token_distributions = {}
+
+    all_stats = {}
+
+    for dataset_name, dataloader in dataset_dataloaders.items():
+        print(
+            f"Computing shift statistics for "
+            f"{dataset_name}...",
+            flush=True,
+        )
+
+        official_source_distribution = (
+            source_token_distributions.get(
+                dataset_name
+            )
+        )
+
+        all_stats[dataset_name] = (
+            compute_dataset_shift_statistics(
+                dataloader=dataloader,
+                model=model,
+                device=device,
+                vocab_size=vocab_size,
+                max_embedding_tokens=(
+                    max_embedding_tokens
+                ),
+                token_distribution_max_tokens=(
+                    token_distribution_max_tokens
+                ),
+                token_distribution=(
+                    official_source_distribution
+                ),
+                token_epsilon=token_epsilon,
+                gaussian_epsilon=gaussian_epsilon,
+            )
+        )
+
+    return all_stats
+
+def fit_common_pca_from_dataset_statistics(
+    all_stats,
+    n_components=20,
+    max_tokens_per_dataset=5000,
+):
+    """
+    Fit one common PCA basis shared by all datasets and batches.
+    """
+    pooled_embeddings = []
+
+    for stats in all_stats.values():
+        embeddings = stats["embeddings"]
+
+        pooled_embeddings.append(
+            embeddings[:max_tokens_per_dataset]
+        )
+
+    pooled_embeddings = torch.cat(
+        pooled_embeddings,
+        dim=0,
+    )
+
+    pca_mean, pca_components = fit_pca(
+        pooled_embeddings,
+        n_components=n_components,
+    )
+
+    return pca_mean, pca_components
+
+def add_pca_statistics(
+    all_stats,
+    pca_mean,
+    pca_components,
+    components_list=(5, 10, 20),
+    epsilon=1e-5,
+):
+    """
+    Project all datasets into the same PCA space and compute
+    Gaussian statistics for each requested dimension.
+    """
+    for dataset_name, stats in all_stats.items():
+        embeddings = stats["embeddings"]
+
+        full_projection = project_pca(
+            embeddings,
+            pca_mean,
+            pca_components,
+        )
+
+        stats["pca"] = {}
+
+        for n_components in components_list:
+            projected = full_projection[:, :n_components]
+
+            mean, covariance = compute_full_gaussian_stats(
+                projected,
+                epsilon=epsilon,
+            )
+
+            stats["pca"][n_components] = {
+                "mean": mean,
+                "covariance": covariance,
+            }
+
+    return all_stats
+
+def compute_dataset_to_source_distances(
+    all_stats,
+    deployment_names,
+    source_names,
+    pca_components_list=(5, 10, 20),
+):
+    """
+    Compute dataset-to-source distances for every deployment/source pair.
+    """
+    distances = {}
+
+    for deployment_name in deployment_names:
+        distances[deployment_name] = {}
+
+        deployment_stats = all_stats[deployment_name]
+
+        for source_name in source_names:
+            source_stats = all_stats[source_name]
+
+            pair_distances = {
+                "token_kl": compute_kl(
+                    deployment_stats["token_distribution"],
+                    source_stats["token_distribution"],
+                ),
+
+                "embedding_mean_l2": compute_l2_distance(
+                    deployment_stats["embedding_mean"],
+                    source_stats["embedding_mean"],
+                ),
+
+                "diag_gaussian_kl": compute_diag_gaussian_kl(
+                    deployment_stats["diag_mean"],
+                    deployment_stats["diag_var"],
+                    source_stats["diag_mean"],
+                    source_stats["diag_var"],
+                ),
+            }
+
+            for n_components in pca_components_list:
+                deployment_pca = deployment_stats["pca"][
+                    n_components
+                ]
+                source_pca = source_stats["pca"][
+                    n_components
+                ]
+
+                pair_distances[
+                    f"pca_gaussian_kl_{n_components}"
+                ] = compute_full_gaussian_kl(
+                    deployment_pca["mean"],
+                    deployment_pca["covariance"],
+                    source_pca["mean"],
+                    source_pca["covariance"],
+                )
+
+            distances[deployment_name][
+                source_name
+            ] = pair_distances
+
+    return distances
+
+def compute_batch_to_source_distances(
+    batch,
+    source_statistics,
+    reference_model,
+    device,
+    pca_mean,
+    pca_components,
+    vocab_size,
+    pca_components_list=(5, 10, 20),
+    token_epsilon=1e-8,
+    gaussian_epsilon=1e-5,
+):
+    """
+    Compute all distances from one arriving batch to each source dataset.
+    """
+    batch_token_distribution = compute_batch_token_distribution(
+        batch,
+        vocab_size=vocab_size,
+        epsilon=token_epsilon,
+    ).cpu()
+
+    batch_embeddings = compute_valid_hidden_states(
+        batch,
+        reference_model,
+        device,
+    ).float().cpu()
+
+    batch_mean = batch_embeddings.mean(dim=0)
+
+    batch_diag_mean, batch_diag_var = compute_diag_gaussian_stats(
+        batch_embeddings,
+        epsilon=gaussian_epsilon,
+    )
+
+    full_batch_projection = project_pca(
+        batch_embeddings,
+        pca_mean,
+        pca_components,
+    )
+
+    batch_pca_stats = {}
+
+    for n_components in pca_components_list:
+        projected = full_batch_projection[:, :n_components]
+
+        mean, covariance = compute_full_gaussian_stats(
+            projected,
+            epsilon=gaussian_epsilon,
+        )
+
+        batch_pca_stats[n_components] = {
+            "mean": mean,
+            "covariance": covariance,
+        }
+
+    distances = {}
+
+    for source_name, source_stats in source_statistics.items():
+        source_distances = {
+            "token_kl": compute_kl(
+                batch_token_distribution,
+                source_stats["token_distribution"],
+            ),
+
+            "embedding_mean_l2": compute_l2_distance(
+                batch_mean,
+                source_stats["embedding_mean"],
+            ),
+
+            "diag_gaussian_kl": compute_diag_gaussian_kl(
+                batch_diag_mean,
+                batch_diag_var,
+                source_stats["diag_mean"],
+                source_stats["diag_var"],
+            ),
+        }
+
+        for n_components in pca_components_list:
+            source_pca = source_stats["pca"][
+                n_components
+            ]
+
+            source_distances[
+                f"pca_gaussian_kl_{n_components}"
+            ] = compute_full_gaussian_kl(
+                batch_pca_stats[n_components]["mean"],
+                batch_pca_stats[n_components]["covariance"],
+                source_pca["mean"],
+                source_pca["covariance"],
+            )
+
+        distances[source_name] = source_distances
+
+    return distances
 
 # -----------------------------------------
 # ---- EXPERIMENT 1: NOISE CALIBRATION ----

@@ -35,14 +35,28 @@ def get_device():
 def move_batch_to_device(batch, device):
     return {key: value.to(device) for key, value in batch.items()} 
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 # ------- MODEL, TOKENIZER AND DATALOADER SETTINGS -------
 
 def setup_model_and_tokenizer(config, device):
-    model = AutoModelForCausalLM.from_pretrained(config["models"]["name"])
+    model = AutoModelForCausalLM.from_pretrained(
+        config["models"]["name"]
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config["models"]["name"]
+    )
+    
     model.to(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(config["models"]["name"])
     tokenizer.pad_token = tokenizer.eos_token
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
@@ -113,6 +127,48 @@ def tokenize_dataset(dataset, tokenizer, config):
     tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names)
     return tokenized_dataset
 
+def tokenize_and_group_dataset(
+    dataset,
+    tokenizer,
+    config,
+):
+    context_length = config["training"]["context_length"]
+
+    def tokenize_function(examples):
+        tokenized = tokenizer(examples["text"], add_special_tokens=False)
+
+        tokenized["input_ids"] = [input_ids + [tokenizer.eos_token_id] for input_ids in tokenized["input_ids"]]
+
+        tokenized["attention_mask"] = [attention_mask + [1] for attention_mask in tokenized["attention_mask"]]
+
+        return tokenized
+
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names,)
+
+    def group_texts(examples):
+        concatenated = {key: sum(examples[key], []) for key in examples.keys()}
+
+        total_length = len(concatenated["input_ids"])
+        total_length = (total_length // context_length) * context_length
+
+        result = {
+            key: [
+                values[i:i + context_length]
+                for i in range(
+                    0,
+                    total_length,
+                    context_length,
+                )
+            ]
+            for key, values in concatenated.items()
+        }
+
+        return result
+
+    grouped_dataset = tokenized_dataset.map(group_texts, batched=True)
+
+    return grouped_dataset
+
 def split_easy_medium_hard(tokenized_dataset, losses, alpha_easy, alpha_hard):
     assert len(tokenized_dataset) == len(losses)
     assert 0 <= alpha_easy <= 1
@@ -174,17 +230,37 @@ def create_three_way_mixture_dataset(easy_dataset, medium_dataset, hard_dataset,
 
     return mixture_dataset
 
-def create_mixture_train_val_loaders(mixture_dataset, data_collator, config):
-    split_dataset = mixture_dataset.train_test_split(test_size=config["training"]["val_split_ratio"], seed=config["training"]["seed"])
+def create_mixture_train_val_loaders(mixture_dataset, data_collator, config,):
+    seed = config["training"]["seed"]
+
+    split_dataset = mixture_dataset.train_test_split(
+        test_size=config["training"]["val_split_ratio"],
+        seed=seed,
+    )
 
     train_dataset = split_dataset["train"]
     val_dataset = split_dataset["test"]
 
-    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=config["training"]["batch_size"], collate_fn=data_collator)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
 
-    val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=config["training"]["batch_size"], collate_fn=data_collator)
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        batch_size=config["training"]["batch_size"],
+        collate_fn=data_collator,
+        generator=generator,
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        batch_size=config["training"]["batch_size"],
+        collate_fn=data_collator,
+    )
 
     return train_dataset, val_dataset, train_dataloader, val_dataloader
+    
 
 def create_probe_dataloader(val_dataset, data_collator, batch_size, probe_seed, probe_size=None):
     if probe_size is None:
@@ -246,34 +322,41 @@ def compute_tail_loss(sample_losses, tail_ratio=0.1):
 
 def evaluation(model, dataloader, device):
     model.eval()
-    sum_loss = 0
+    total_loss = 0
+    total_tokens = 0
     correct = 0
-    total = 0
+    loss_function = torch.nn.CrossEntropyLoss(reduction="sum", ignore_index=-100)
 
     with torch.no_grad():
         for batch in dataloader:
             batch = move_batch_to_device(batch, device)
             outputs = model(**batch)
-
-            sum_loss += outputs.loss.item()
-
             logits = outputs.logits
             labels = batch["labels"]
 
-            shift_logits = logits[:, :-1, :]
-            shift_labels = labels[:, 1:]
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
 
-            predictions = torch.argmax(shift_logits, dim=-1)
-            mask = shift_labels != -100
+            flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+            flat_labels = shift_labels.view(-1)
 
-            correct += (predictions[mask] == shift_labels[mask]).sum().item()
-            total += mask.sum().item()
+            batch_loss = loss_function(flat_logits, flat_labels) # compute the sum of the loss for the batch
+            mask = flat_labels != -100
 
-    loss = sum_loss / len(dataloader)
-    ppl = math.exp(loss)
-    acc = correct / total if total > 0 else 0
+            total_loss += batch_loss.item()
+            total_tokens += mask.sum().item()
 
-    return loss, ppl, acc
+            predictions = flat_logits.argmax(dim=-1)
+            correct += (predictions[mask] == flat_labels[mask]).sum().item()
+    if total_tokens == 0:
+        raise ValueError("No valid tokens found in the dataloader.")
+
+
+    avg_loss = total_loss / total_tokens
+    ppl = math.exp(avg_loss)
+    acc = correct / total_tokens if total_tokens > 0 else 0
+
+    return avg_loss, ppl, acc, total_tokens
 
 def compute_shift_severity(config, clean_dataset, shifted_dataset, data_collator, device):
     model, _, _ = setup_model_and_tokenizer(config, device)
@@ -307,6 +390,39 @@ def train_one_epoch(model, train_dataloader, optimizer, device):
     avg_loss = total_loss / len(train_dataloader)
 
     return avg_loss
+
+def train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accumulation_steps, scheduler=None):
+    if accumulation_steps <= 0:
+        raise ValueError("accumulation_steps must be a positive integer.")
+    model.train()
+    total_loss = 0
+    num_batches = len(train_dataloader)
+    optimizer.zero_grad(set_to_none=True)  # Initialize the gradients to zero
+    for i, batch in enumerate(train_dataloader):
+        batch = move_batch_to_device(batch, device)
+
+        outputs = model(**batch)
+        loss = outputs.loss 
+        total_loss += loss.item()
+
+        group_start = (i // accumulation_steps) * accumulation_steps
+        current_group_size = min(accumulation_steps, num_batches - group_start)
+
+        scaled_loss = loss / current_group_size  # Scale the loss by the number of steps in the current group
+        scaled_loss.backward()  # Accumulate gradients
+
+        is_end_of_group = ( (i + 1) % accumulation_steps == 0)
+        is_last_batch = (i == num_batches - 1)
+
+        if is_end_of_group or is_last_batch:
+            optimizer.step()  # Update model parameters
+            if scheduler is not None:
+                scheduler.step()  # Update learning rate
+            optimizer.zero_grad(set_to_none=True)  # Reset gradients to zero
+
+    avg_loss = total_loss / num_batches
+    return avg_loss
+
 
 def KL_DRO_one_epoch(model, train_dataloader, optimizer, gamma, lambd, rho, device):
     model.train()
@@ -350,11 +466,72 @@ def KL_DRO_one_epoch(model, train_dataloader, optimizer, gamma, lambd, rho, devi
 
         total_mix_loss += mix_loss.item()
 
-        mix_loss.backward()
+        mix_loss.backward() 
         optimizer.step()
     
     avg_mix_loss = total_mix_loss / len(train_dataloader)
     return avg_mix_loss
+
+def KL_DRO_one_epoch_accumulated(model, train_dataloader, optimizer, gamma, lambd, rho, device, accumulation_steps):
+    if accumulation_steps <= 0:
+        raise ValueError("accumulation_steps must be a positive integer.")
+    model.train()
+    total_mix_loss = 0
+    num_batches = len(train_dataloader)
+    optimizer.zero_grad(set_to_none=True)  # Initialize the gradients to zero
+    loss_function = torch.nn.CrossEntropyLoss(reduction="none")
+
+    for i, batch in enumerate(train_dataloader):
+        batch = move_batch_to_device(batch, device)
+
+        outputs = model(**batch)
+
+        avg_loss = outputs.loss
+
+        # Compute Kl-DRO Loss:
+        logits = outputs.logits
+        labels = batch["labels"]
+
+        logits = logits[:, :-1, :] #shifted.
+        labels = labels[:, 1:]
+
+        mask = labels != -100
+
+        logits = logits.reshape(-1, logits.size(-1))# logits:(batch, sequence_length, vocab_size) -> (batch*sequence_length, vocab_size)
+        labels = labels.reshape(-1) # labels:(batch, sequence_length) -> (batch*sequence_length)
+
+        token_losses = loss_function(logits, labels) # loss per token
+        token_losses = token_losses.reshape(batch["input_ids"].size(0), -1) # reshape back to (batch, sequence_length)
+        token_losses = token_losses * mask # puting the pad loss to 0.
+
+        sample_loss = token_losses.sum(dim=1) / mask.sum(dim=1)
+
+        log_mean_exp = torch.logsumexp(sample_loss / lambd, dim=0) - torch.log(
+            torch.tensor(len(sample_loss), device=device, dtype=sample_loss.dtype)
+        )
+
+        dro_loss = lambd * log_mean_exp + lambd * rho
+
+        # Compute Mix_loss:
+        mix_loss = (1 - gamma) * avg_loss + gamma * dro_loss
+
+        total_mix_loss += mix_loss.item()
+
+        group_start = (i // accumulation_steps) * accumulation_steps
+        current_group_size = min(accumulation_steps, num_batches - group_start)
+
+        scaled_mix_loss = mix_loss / current_group_size  # Scale the loss by the number of steps in the current group
+        scaled_mix_loss.backward()  # Accumulate gradients
+
+        is_end_of_group = ( (i + 1) % accumulation_steps == 0)
+        is_last_batch = (i == num_batches - 1)
+
+        if is_end_of_group or is_last_batch:
+            optimizer.step()  # Update model parameters
+            optimizer.zero_grad(set_to_none=True)  # Reset gradients to zero
+    avg_mix_loss = total_mix_loss / num_batches
+    return avg_mix_loss
+
 
 def train_method(method_name, train_dataloader, val_dataloader, clean_reference_dataset, close_dataset,
                 mid_dataset, far_dataset, data_collator, device, config):
