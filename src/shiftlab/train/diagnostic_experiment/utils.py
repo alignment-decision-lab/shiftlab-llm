@@ -6,10 +6,11 @@ import random
 import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from datasets import concatenate_datasets
+from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForLanguageModeling
 import matplotlib.pyplot as plt
 import os
+
 
 
 # ------- GENERAL SETTINGS -------
@@ -169,6 +170,213 @@ def tokenize_and_group_dataset(
 
     return grouped_dataset
 
+
+def tokenize_and_group_with_token_budget(
+    dataset,
+    tokenizer,
+    config,
+    add_eos_between_documents=True,
+):
+    """
+    Tokenize a dataset progressively and build fixed-length token blocks
+    until a predefined token budget is reached.
+
+    This function is designed to work with both Hugging Face Dataset
+    and IterableDataset objects.
+
+    Parameters
+    ----------
+    dataset:
+        Hugging Face Dataset or IterableDataset.
+
+    tokenizer:
+        Hugging Face tokenizer.
+
+    config:
+        Configuration dictionary containing:
+            config["dataset"]["text_column"]
+            config["training"]["context_length"]
+            config["training"]["max_tokens"]
+
+    add_eos_between_documents:
+        If True, insert one EOS token between consecutive documents.
+
+    Returns
+    -------
+    Dataset
+        A finite Hugging Face Dataset containing fixed-length sequences
+        with columns:
+            - input_ids
+            - attention_mask
+
+    Notes
+    -----
+    - Only complete context windows are returned.
+    - The effective number of retained tokens is therefore:
+          n_sequences * context_length
+    - The function stops as soon as enough tokens have been collected
+      to satisfy the requested token budget.
+    """
+
+    dataset_cfg = config["dataset"]
+    training_cfg = config["training"]
+
+    text_column = dataset_cfg.get("text_column", "text")
+    context_length = int(training_cfg["context_length"])
+    max_tokens = int(training_cfg["max_tokens"])
+
+    if context_length <= 0:
+        raise ValueError(
+            "context_length must be a positive integer."
+        )
+
+    if max_tokens <= 0:
+        raise ValueError(
+            "max_tokens must be a positive integer."
+        )
+
+    # We only keep complete context windows.
+    max_sequences = max_tokens // context_length
+
+    if max_sequences == 0:
+        raise ValueError(
+            f"max_tokens={max_tokens} is smaller than "
+            f"context_length={context_length}."
+        )
+
+    # Exact number of tokens that will actually be used.
+    usable_token_budget = max_sequences * context_length
+
+    input_blocks = []
+    attention_blocks = []
+
+    # Temporary buffer containing tokens not yet assigned
+    # to a complete context window.
+    token_buffer = []
+    buffer_start = 0
+
+    num_documents = 0
+    num_raw_tokens = 0
+    num_sequences = 0
+
+    eos_token_id = tokenizer.eos_token_id
+
+    if add_eos_between_documents and eos_token_id is None:
+        raise ValueError(
+            "add_eos_between_documents=True but the tokenizer "
+            "does not define an eos_token_id."
+        )
+
+    for example in dataset:
+
+        if num_sequences >= max_sequences:
+            break
+
+        text = example.get(text_column)
+
+        # Normalize possible non-string values.
+        if isinstance(text, list):
+            text = " ".join(map(str, text))
+
+        if text is None:
+            continue
+
+        text = str(text).strip()
+
+        if len(text) <= 5:
+            continue
+
+        # Exact tokenization of the complete document.
+        #
+        # verbose=False prevents Hugging Face from printing the
+        # "sequence length > model_max_length" warning. The long
+        # sequence is NEVER passed to the model: it is immediately
+        # split below into context_length blocks.
+        token_ids = tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=False,
+            return_attention_mask=False,
+            verbose=False,
+        )["input_ids"]
+
+        if not token_ids:
+            continue
+
+        num_documents += 1
+        num_raw_tokens += len(token_ids)
+
+        # Separate documents explicitly instead of concatenating
+        # unrelated texts with no boundary marker.
+        if add_eos_between_documents:
+            token_ids.append(eos_token_id)
+
+        token_buffer.extend(token_ids)
+
+        # Consume complete context windows from the buffer.
+        while (
+            len(token_buffer) - buffer_start >= context_length
+            and num_sequences < max_sequences
+        ):
+            end = buffer_start + context_length
+
+            block = token_buffer[buffer_start:end]
+
+            input_blocks.append(block)
+            attention_blocks.append(
+                [1] * context_length
+            )
+
+            buffer_start = end
+            num_sequences += 1
+
+        # Periodically remove already-consumed tokens from memory.
+        if buffer_start >= 100_000:
+            token_buffer = token_buffer[buffer_start:]
+            buffer_start = 0
+
+    effective_tokens = num_sequences * context_length
+
+    if num_sequences < max_sequences:
+        print(
+            "\nWARNING: The dataset ended before the requested "
+            "token budget was reached.",
+            flush=True,
+        )
+
+    print(
+        "\n===== Token-budget dataset construction =====\n"
+        f"Documents consumed:       {num_documents:,}\n"
+        f"Raw text tokens seen:     {num_raw_tokens:,}\n"
+        f"Requested max tokens:     {max_tokens:,}\n"
+        f"Usable token budget:      {usable_token_budget:,}\n"
+        f"Sequences created:        {num_sequences:,}\n"
+        f"Context length:           {context_length:,}\n"
+        f"Effective tokens retained:{effective_tokens:,}\n"
+        "=============================================\n",
+        flush=True,
+    )
+
+    tokenized_dataset = Dataset.from_dict(
+        {
+            "input_ids": input_blocks,
+            "attention_mask": attention_blocks,
+        }
+    )
+
+    dataset_stats = {
+        "num_documents_used": num_documents,
+        "raw_tokens_seen": num_raw_tokens,
+        "requested_max_tokens": max_tokens,
+        "usable_token_budget": usable_token_budget,
+        "num_sequences": num_sequences,
+        "context_length": context_length,
+        "effective_tokens": effective_tokens,
+    }
+
+    return tokenized_dataset, dataset_stats
+    
+
 def split_easy_medium_hard(tokenized_dataset, losses, alpha_easy, alpha_hard):
     assert len(tokenized_dataset) == len(losses)
     assert 0 <= alpha_easy <= 1
@@ -230,11 +438,40 @@ def create_three_way_mixture_dataset(easy_dataset, medium_dataset, hard_dataset,
 
     return mixture_dataset
 
-def create_mixture_train_val_loaders(mixture_dataset, data_collator, config,):
-    seed = config["training"]["seed"]
+def create_training_dataloaders(
+    tokenized_dataset,
+    data_collator,
+    training_config,
+    step_eval_size=512,
+):
+    """
+    Create all dataloaders required for fine-tuning experiments.
 
-    split_dataset = mixture_dataset.train_test_split(
-        test_size=config["training"]["val_split_ratio"],
+    Returns
+    -------
+    train_optim_dataloader:
+        Dataloader used for optimization steps.
+        It uses the training split with shuffle=True.
+
+    train_dataloader:
+        Dataloader used for full training-set evaluation
+        (train loss evolution after each epoch).
+
+    val_dataloader:
+        Dataloader used for validation evaluation.
+        It is a held-out split never used for optimization.
+
+    train_step_eval_dataloader:
+        Small fixed subset of the training set used for
+        frequent evaluation during the first optimization steps.
+        This avoids evaluating the full training set every few steps.
+    """
+
+    seed = training_config["seed"]
+
+    # Split dataset into optimization and validation subsets
+    split_dataset = tokenized_dataset.train_test_split(
+        test_size=training_config["val_split_ratio"],
         seed=seed,
     )
 
@@ -244,22 +481,62 @@ def create_mixture_train_val_loaders(mixture_dataset, data_collator, config,):
     generator = torch.Generator()
     generator.manual_seed(seed)
 
-    train_dataloader = DataLoader(
+    # -------------------------------------------------
+    # Optimization dataloader
+    # Used for gradient updates
+    # -------------------------------------------------
+    train_optim_dataloader = DataLoader(
         train_dataset,
+        batch_size=training_config["batch_size"],
         shuffle=True,
-        batch_size=config["training"]["batch_size"],
         collate_fn=data_collator,
         generator=generator,
     )
 
-    val_dataloader = DataLoader(
-        val_dataset,
+    # -------------------------------------------------
+    # Full training evaluation dataloader
+    # Used to compute train loss after each epoch
+    # -------------------------------------------------
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=training_config["batch_size"],
         shuffle=False,
-        batch_size=config["training"]["batch_size"],
         collate_fn=data_collator,
     )
 
-    return train_dataset, val_dataset, train_dataloader, val_dataloader
+    # -------------------------------------------------
+    # Validation dataloader
+    # Held-out data
+    # -------------------------------------------------
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=training_config["batch_size"],
+        shuffle=False,
+        collate_fn=data_collator,
+    )
+
+    # -------------------------------------------------
+    # Step evaluation dataloader
+    # Fixed subset for frequent evaluation
+    # -------------------------------------------------
+    step_eval_dataset = train_dataset.select(
+        range(min(step_eval_size, len(train_dataset)))
+    )
+
+    train_step_eval_dataloader = DataLoader(
+        step_eval_dataset,
+        batch_size=training_config["batch_size"],
+        shuffle=False,
+        collate_fn=data_collator,
+    )
+
+    return (
+        train_optim_dataloader,
+        train_dataloader,
+        val_dataloader,
+        train_step_eval_dataloader,
+    )
+
     
 
 def create_probe_dataloader(val_dataset, data_collator, batch_size, probe_seed, probe_size=None):
@@ -422,6 +699,121 @@ def train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accu
 
     avg_loss = total_loss / num_batches
     return avg_loss
+
+def train_with_step_logging(
+    model,
+    train_optim_dataloader,
+    train_dataloader,
+    val_dataloader,
+    train_step_eval_dataloader,
+    optimizer,
+    device,
+    accumulation_steps,
+    eval_every_optimizer_steps=10,
+    eval_first_epoch_only=True,
+    max_epochs=10,
+):
+    global_step = 0
+    cumulative_tokens_seen = 0
+
+    step_history = []
+    epoch_history = []
+
+    # ---------- STEP 0 ----------
+    train_loss, train_ppl, train_acc, _ = evaluation(model, train_step_eval_dataloader, device=device)
+
+    val_loss, val_ppl, val_acc, _ = evaluation(model, val_dataloader, device=device)
+
+    step_history.append({
+        "optimizer_step": 0,
+        "cumulative_tokens_seen": 0,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+    })
+
+    optimizer.zero_grad(set_to_none=True)
+
+    # ---------- TRAINING ----------
+    for epoch in range(max_epochs):
+        model.train()
+
+        num_batches = len(train_optim_dataloader)
+
+        for i, batch in enumerate(train_optim_dataloader):
+
+            batch = move_batch_to_device(batch, device)
+
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            # Count actual tokens seen.
+            cumulative_tokens_seen += batch["attention_mask"].sum().item() # Count the number of tokens seen in the current batch and add it to the cumulative count.
+
+            # Same accumulation logic as the previous validated training function.
+            group_start = i // accumulation_steps * accumulation_steps
+            current_group_size = min(accumulation_steps, num_batches - group_start)
+
+            scaled_loss = loss / current_group_size
+            scaled_loss.backward()
+
+            is_end_of_group =( (i + 1) % accumulation_steps == 0 )
+            is_last_batch = ( i == num_batches - 1 )
+
+            if is_end_of_group or is_last_batch:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1 # Count the number of optimizer steps taken.
+
+                # Fine-grained evaluation:
+                if (
+                    (not eval_first_epoch_only or epoch == 0)
+                    and global_step % eval_every_optimizer_steps == 0
+                ): # To evaluate every few optimizer steps.
+                    train_loss, train_ppl, train_acc, _ = evaluation(model, train_step_eval_dataloader, device=device)
+                    val_loss, val_ppl, val_acc, _ = evaluation(model, val_dataloader, device=device)
+
+                    step_history.append({
+                        "optimizer_step": global_step,
+                        "cumulative_tokens_seen": cumulative_tokens_seen,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                    })
+                    model.train()
+
+        # ---------- END OF EPOCH ----------
+        train_loss, train_ppl, train_acc, _ = evaluation(model, train_dataloader, device=device)
+        val_loss, val_ppl, val_acc, _ = evaluation(model, val_dataloader, device=device)
+        if not eval_first_epoch_only or epoch == 0:
+            if step_history[-1]["optimizer_step"] != global_step:
+
+                step_train_loss, _, _, _ = evaluation(model, train_step_eval_dataloader, device=device)
+
+                step_history.append({
+                    "optimizer_step": global_step,
+                    "cumulative_tokens_seen": cumulative_tokens_seen,
+                    "train_loss": step_train_loss,
+                    "val_loss": val_loss,
+                })
+
+        epoch_history.append({
+            "epoch": epoch + 1,
+            "optimizer_step": global_step,
+            "cumulative_tokens_seen": cumulative_tokens_seen,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+        })
+
+        print(
+            f"Epoch {epoch + 1}/{max_epochs} | "
+            f"step={global_step} | "
+            f"tokens={cumulative_tokens_seen:,} | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f}",
+            flush=True,
+        )
+
+    return step_history, epoch_history
 
 
 def KL_DRO_one_epoch(model, train_dataloader, optimizer, gamma, lambd, rho, device):
@@ -804,4 +1196,37 @@ def plot_robustness_boxplots(results, config):
 
     plt.tight_layout()
     plt.savefig(f"{output_dir}/robustness_boxplots.png")
+    plt.close()
+
+def plot_comparison_curve(
+    df,
+    x_column,
+    y_column,
+    xlabel,
+    ylabel,
+    title,
+    output_path,
+):
+    """
+    Plot one loss metric for all injection rates on the same figure.
+
+    Each injection rate corresponds to one curve.
+    """
+
+    plt.figure(figsize=(10, 6))
+
+    injection_rates = sorted(df["injection_rate"].unique())
+
+    for injection_rate in injection_rates:
+        subset = df[df["injection_rate"] == injection_rate].sort_values(x_column)
+        label = f"p = {100 * injection_rate:.0f}%"
+        plt.plot(subset[x_column], subset[y_column], marker="o", label=label)
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid()
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300,)
     plt.close()
