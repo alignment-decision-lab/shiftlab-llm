@@ -58,11 +58,11 @@ datasets_config = {
     },
 },
     
-"OWT": {
+"OWT2": {
     "dataset": {
         "type": "hf_text",
-        "name": "Skylion007/openwebtext",
-        "split": "train",
+        "name": "suolyer/pile_openwebtext2",
+        "split": "validation",
         "text_column": "text",
         "streaming": True,
     },

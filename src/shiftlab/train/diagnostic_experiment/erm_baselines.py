@@ -4,16 +4,30 @@ import utils
 import pandas as pd
 import torch.optim as optim
 from shiftlab.data.load_datasets import load_dataset_from_subconfig
-import copy
 import matplotlib.pyplot as plt
 import time
-from torch.utils.data import DataLoader
-import math
-from torch.optim.lr_scheduler import LambdaLR
+import copy
 
+MODEL_NAME = "gpt2-medium"
+
+TRAINING_CONFIG = {
+    "seed": 42,
+    "context_length": 512,
+    "max_tokens": 5_120_000,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 2e-5,
+    "weight_decay": 0.0,
+    "val_split_ratio": 0.1,
+    "max_epochs": 10,
+    "gamma": 0.7,
+    "rho": 0.0,
+    "eval_every_optimizer_steps": 500,
+    "eval_first_epoch_only": False,
+}
 
 datasets_config = {
-      "PG-19": {     # This dataset's configurations have been verified and thus should not change.
+      "PG-19": {     
       "dataset": {
           "type": "hf_text",
           "name": "emozilla/pg19",
@@ -21,18 +35,7 @@ datasets_config = {
           "text_column": "text",
           "streaming": True,
       },
-      "training": {
-          "batch_size": 4,
-          "gradient_accumulation_steps": 4,
-          "learning_rate": 0.00002,
-          "context_length": 512,
-          "weight_decay": 0.0,
-          "dataset_size": 10000,
-          "seed": 42,
-          "val_split_ratio": 0.1,
-          "gamma": 0.7,
-          "rho": 0.0
-      }},
+      },
 
      "PubMed Abstracts": {
      "dataset": {
@@ -42,19 +45,7 @@ datasets_config = {
          "text_column": "text",
          "streaming": True,
      },
-     "training": {
-         "batch_size": 4,
-         "gradient_accumulation_steps": 4,
-         "learning_rate": 0.00002,
-         "context_length": 512,
-         "weight_decay": 0.0,
-         "dataset_size": 50000,  # 50 000 is taking too long to train, maybe try 30 000.
-
-         "seed": 42,
-         "val_split_ratio": 0.1,
-         "gamma": 0.7,
-         "rho": 0.0
-     }},
+     },
 
      "GitHub": {     
      "dataset": {
@@ -64,19 +55,7 @@ datasets_config = {
          "text_column": "text",
          "streaming": True,
      },
-     "training": {
-         "batch_size": 4,
-         "gradient_accumulation_steps": 4,
-         "learning_rate": 0.00002,
-         "context_length": 512,
-         "weight_decay": 0.0,
-         "dataset_size": 10000,
-
-         "seed": 42,
-         "val_split_ratio": 0.1,
-         "gamma": 0.7,
-         "rho": 0.0
-     }},
+     },
 
     "Ubuntu IRC": {
         "dataset": {
@@ -85,26 +64,7 @@ datasets_config = {
             "split": "train",
             "text_column": "text",
             "streaming": True,
-
-            # Reserve everything after the first 10,000 raw documents
-            # for the held-out deployment evaluation.
-            "dataset_offset": 0,
-        },
-        "training": {
-            "batch_size": 4,
-            "gradient_accumulation_steps": 4,
-            "learning_rate": 0.00002,
-            "context_length": 512,
-            "weight_decay": 0.0,
-
-            # Raw documents used to construct the oracle training corpus.
-            "dataset_size": 10000,
-
-            "seed": 42,
-            "val_split_ratio": 0.1,
-            "gamma": 0.7,
-            "rho": 0.0,
-        },
+    },
     },
 
     "YouTube Subtitles": {
@@ -114,32 +74,14 @@ datasets_config = {
             "split": "validation",
             "text_column": "text",
             "streaming": True,
-
-            # Train the oracle only on the first 500 raw transcripts.
-            "dataset_offset": 0,
-        },
-        "training": {
-            "batch_size": 4,
-            "gradient_accumulation_steps": 4,
-            "learning_rate": 0.00002,
-            "context_length": 512,
-            "weight_decay": 0.0,
-
-            # Keep documents 500 onward for deployment evaluation.
-            "dataset_size": 500,
-
-            "seed": 42,
-            "val_split_ratio": 0.1,
-            "gamma": 0.7,
-            "rho": 0.0,
-        },
+    },
     },
 }
 
 
 
 def collect_erm_configs(datasets_config):
-    """Create one complete ERM configuration per dataset."""
+    """Create one complete ERM configuration per deployment dataset."""
     one_configs = []
 
     for dataset_name, dataset_config in datasets_config.items():
@@ -147,272 +89,398 @@ def collect_erm_configs(datasets_config):
 
         cfg["dataset_name"] = dataset_name
         cfg["models"] = {
-            "name": "gpt2-medium",
+            "name": MODEL_NAME,
         }
+        cfg["training"] = copy.deepcopy(TRAINING_CONFIG)
 
         one_configs.append(cfg)
 
     return one_configs
 
 
-def plot_training_curves(results, dataset_name, output_dir):
-    """Plot ERM train and validation losses."""
+def plot_model_training_curves(step_history, epoch_history, dataset_name, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
 
-    epochs = range(
-        1,
-        len(results["train_losses"]) + 1,
-    )
+    step_df = pd.DataFrame(step_history)
+    epoch_df = pd.DataFrame(epoch_history)
 
-    plt.figure(figsize=(10, 6))
-
+    # Loss vs epochs
+    plt.figure(figsize=(9, 6))
     plt.plot(
-        epochs,
-        results["train_losses"],
+        epoch_df["epoch"],
+        epoch_df["train_loss"],
         marker="o",
-        label="Train loss",
+        label="Train CE loss",
     )
-
     plt.plot(
-        epochs,
-        results["val_losses"],
+        epoch_df["epoch"],
+        epoch_df["val_loss"],
         marker="o",
-        label="Validation loss",
+        label="Validation CE loss",
     )
-
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(
-        f"ERM training curves for {dataset_name}"
-    )
-
-    plt.xticks(list(epochs))
-    plt.grid()
+    plt.ylabel("Cross-entropy loss")
+    plt.title(f"{dataset_name} — ERM loss vs epochs")
+    plt.grid(True)
     plt.legend()
     plt.tight_layout()
+    plt.savefig(
+        os.path.join(output_dir, "loss_vs_epochs.png"),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
 
+    # Loss vs optimizer steps
+    plt.figure(figsize=(9, 6))
+    plt.plot(
+        step_df["optimizer_step"],
+        step_df["train_loss"],
+        marker="o",
+        label="Train CE loss",
+    )
+    plt.plot(
+        step_df["optimizer_step"],
+        step_df["val_loss"],
+        marker="o",
+        label="Validation CE loss",
+    )
+    plt.xlabel("Optimizer steps")
+    plt.ylabel("Cross-entropy loss")
+    plt.title(f"{dataset_name} — ERM loss vs optimizer steps")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
     plt.savefig(
         os.path.join(
             output_dir,
-            "training_curves.png",
+            "loss_vs_optimizer_steps.png",
         ),
         dpi=300,
+        bbox_inches="tight",
     )
-
     plt.close()
 
+    # Loss vs cumulative tokens
+    plt.figure(figsize=(9, 6))
+    plt.plot(
+        step_df["cumulative_tokens_seen"],
+        step_df["train_loss"],
+        marker="o",
+        label="Train CE loss",
+    )
+    plt.plot(
+        step_df["cumulative_tokens_seen"],
+        step_df["val_loss"],
+        marker="o",
+        label="Validation CE loss",
+    )
+    plt.xlabel("Cumulative training tokens seen")
+    plt.ylabel("Cross-entropy loss")
+    plt.title(f"{dataset_name} — ERM loss vs tokens")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(
+            output_dir,
+            "loss_vs_cumulative_tokens.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
 
-def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta= 0.001):
-    """ Train an ERM model for a given dataset using early stopping. """
+def train_one_erm_model(one_config, device):
     dataset_cfg = one_config["dataset"]
     training_cfg = one_config["training"]
     dataset_name = one_config["dataset_name"]
-    print(f"\n ===== Training ERM with dataset {dataset_name} =====", flush=True)
-    seed = training_cfg.get("seed", 42)
+
+    print(f"\n===== Training oracle ERM on {dataset_name} =====", flush=True)
+
+    seed = training_cfg["seed"]
     utils.set_seed(seed)
 
-    model, tokenizer, data_collator = utils.setup_model_and_tokenizer(one_config, device)
-    model_name = f"{one_config['models']['name']}_ERM_dataset_{dataset_name}"
+    # --------------------------------------------------------
+    # MODEL / TOKENIZER
+    # --------------------------------------------------------
 
-    dataset = load_dataset_from_subconfig(dataset_cfg, training_cfg)
-    tokenized_dataset = utils.tokenize_and_group_dataset(dataset, tokenizer, one_config)
-    train_dataset, val_dataset, train_dataloader, val_dataloader = (
-        utils.create_mixture_train_val_loaders(
-            tokenized_dataset,
-            data_collator,
-            one_config
+    model, tokenizer, data_collator = utils.setup_model_and_tokenizer(one_config, device)
+
+    # --------------------------------------------------------
+    # DATASET
+    # --------------------------------------------------------
+
+    raw_dataset = load_dataset_from_subconfig(dataset_cfg, training_cfg)
+
+    tokenized_dataset, dataset_stats = (
+        utils.tokenize_and_group_with_token_budget(
+            dataset=raw_dataset,
+            tokenizer=tokenizer,
+            config=one_config,
         )
     )
-    train_eval_dataloader = DataLoader(
-        train_dataset,
-        shuffle=False,
-        batch_size=training_cfg["batch_size"],
-        collate_fn=data_collator,
+
+    # --------------------------------------------------------
+    # DATALOADERS
+    # --------------------------------------------------------
+
+    (
+        train_optim_dataloader,
+        train_dataloader,
+        val_dataloader,
+        train_step_eval_dataloader,
+    ) = utils.create_training_dataloaders(
+        tokenized_dataset=tokenized_dataset,
+        data_collator=data_collator,
+        training_config=training_cfg,
     )
 
+    num_train_sequences = len(train_dataloader.dataset)
+    num_val_sequences = len(val_dataloader.dataset)
+
+    print(
+        "=============================\n"
+        f"Train sequences:         {num_train_sequences:,}\n"
+        f"Validation sequences:    {num_val_sequences:,}\n"
+        f"Train tokens / epoch:    "
+        f"{num_train_sequences * training_cfg['context_length']:,}\n"
+        f"Validation tokens:       "
+        f"{num_val_sequences * training_cfg['context_length']:,}\n"
+        "=============================\n",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # OPTIMIZER
+    # --------------------------------------------------------
 
     optimizer = optim.AdamW(
-            model.parameters(),
-            lr=float(training_cfg["learning_rate"]),
-            weight_decay=float(training_cfg.get("weight_decay", 0.0))
-        )
-    accumulation_steps = training_cfg.get("gradient_accumulation_steps", 1)
+        model.parameters(),
+        lr=float(training_cfg["learning_rate"]),
+        weight_decay=float(training_cfg["weight_decay"]),
+    )
 
-    
-    final_lr_ratio = training_cfg.get("final_lr_ratio") # Final learning rate as a fraction of the initial learning rate.
-    scheduler = None
-    if final_lr_ratio is not None:
-        num_optimizer_step_per_epoch = math.ceil(len(train_dataloader) / accumulation_steps) # Number of updates per epoch.
-        num_training_steps = max_epochs * num_optimizer_step_per_epoch # Maximum number of updates for the entire training process.
-        def linear_decay(step):
-            """Linear decay function for learning rate scheduling."""
-            progress = min(step / num_training_steps, 1.0) # Progress is the fraction of training completed.
-            return 1.0 - progress * (1.0 - final_lr_ratio) # Linear decay from 1.0 to final_lr_ratio over the course of training.
-        scheduler = LambdaLR(optimizer, lr_lambda=linear_decay)
+    # --------------------------------------------------------
+    # OUTPUTS
+    # --------------------------------------------------------
 
     dataset_dir = os.path.join(
-        "outputs/erm_baselines",
+        "outputs",
+        "erm_baselines",
         dataset_name.replace(" ", "_"),
     )
 
-    analysis_dir = os.path.join(
-        dataset_dir,
-        "training_analysis",
-    )
-
-    model_dir = os.path.join(
-         dataset_dir,
-         "model",
-     )  ###
+    analysis_dir = os.path.join(dataset_dir, "training_analysis")
+    model_dir = os.path.join(dataset_dir, "model")
 
     os.makedirs(analysis_dir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)  ###
+    os.makedirs(model_dir, exist_ok=True)
 
-    optim_losses = []
-    train_losses = []
-    val_losses = []
-    train_ppls = []
-    val_ppls = []
-    train_accs = []
-    val_accs = []
-    learning_rates = []
-    best_val_loss = float("inf")
-    best_epoch = 0
-    epochs_without_improvement = 0
-    stopping_reason = "max_epochs_reached"
+    # --------------------------------------------------------
+    # TRAINING -- FIXED 10 EPOCHS
+    # --------------------------------------------------------
 
-    for epoch in range(max_epochs):
-        optim_loss = utils.train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accumulation_steps, scheduler)
-        optim_losses.append(optim_loss)
-        current_lr = optimizer.param_groups[0]['lr']
-        learning_rates.append(current_lr)
-        train_loss, train_ppl, train_acc, _ = utils.evaluation(model, train_eval_dataloader, device=device)
-        val_loss, val_ppl, val_acc, _ = utils.evaluation(model, val_dataloader, device=device)
+    step_history, epoch_history = utils.train_with_step_logging(
+        model=model,
+        train_optim_dataloader=train_optim_dataloader,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        train_step_eval_dataloader=train_step_eval_dataloader,
+        optimizer=optimizer,
+        device=device,
+        accumulation_steps=training_cfg[
+            "gradient_accumulation_steps"
+        ],
+        eval_every_optimizer_steps=training_cfg[
+            "eval_every_optimizer_steps"
+        ],
+        eval_first_epoch_only=training_cfg[
+            "eval_first_epoch_only"
+        ],
+        max_epochs=training_cfg["max_epochs"],
+    )
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_ppls.append(train_ppl)
-        val_ppls.append(val_ppl)
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
+    # --------------------------------------------------------
+    # SAVE FINAL MODEL
+    # --------------------------------------------------------
 
-        improvement = best_val_loss - val_loss
+    model.save_pretrained(model_dir)
+    tokenizer.save_pretrained(model_dir)
 
-        if improvement > min_delta:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            epochs_without_improvement = 0
+    print(
+        f"Final ERM model saved to: {model_dir}",
+        flush=True,
+    )
 
-            model.save_pretrained(model_dir)  ###
-            tokenizer.save_pretrained(model_dir)  ###
+    # --------------------------------------------------------
+    # SAVE HISTORIES
+    # --------------------------------------------------------
 
-            print(
-                 f"New best model saved at epoch {epoch + 1} "
-                 f"with validation loss {val_loss:.4f}.",
-                 flush=True,
-             )  ###
-        else:
-            epochs_without_improvement += 1
-        
-        print(
-            f"Epoch {epoch + 1}/{max_epochs} | "
-            f"lr: {current_lr:.2e} | "
-            f"train loss: {train_loss:.4f} | "
-            f"train ppl: {train_ppl:.4f} | "
-            f"optim loss: {optim_loss:.4f} | "
-            f"val loss: {val_loss:.4f} | "
-            f"val ppl: {val_ppl:.4f} | "
-            f"best val loss: {min(best_val_loss, val_loss):.4f}",
-            flush=True,
-        )
-        
-        if epochs_without_improvement >= patience:
-            stopping_reason = "early_stopping"
-            print(f"Early stopping triggered at epoch {epoch + 1}. Best validation loss: {best_val_loss:.4f} at epoch {best_epoch + 1}.", flush=True)
-            break
-    
-    epochs_run = len(train_losses)
+    step_df = pd.DataFrame(step_history)
+    epoch_df = pd.DataFrame(epoch_history)
 
-    history_df = pd.DataFrame({
-        "epoch": range(1, epochs_run + 1),
-        "learning_rate": learning_rates,
-        "optim_loss": optim_losses,
-        "train_loss": train_losses,
-        "val_loss": val_losses,
-        "train_ppl": train_ppls,
-        "val_ppl": val_ppls,
-        "train_acc": train_accs,
-        "val_acc": val_accs,
-    })
-    history_path = os.path.join(analysis_dir, "training_history.csv")
-    history_df.to_csv(history_path, index=False)
+    step_history_path = os.path.join(analysis_dir, "step_history.csv")
+    epoch_history_path = os.path.join(analysis_dir, "epoch_history.csv")
 
-    results = {
-        "train_losses": train_losses,
-        "val_losses": val_losses,
-        "train_ppls": train_ppls,
-        "val_ppls": val_ppls,
-        "train_accs": train_accs,
-        "val_accs": val_accs,
-    }
-    plot_training_curves(results, dataset_name, analysis_dir)
+    step_df.to_csv(step_history_path, index=False)
+    epoch_df.to_csv(epoch_history_path, index=False)
+
+    # --------------------------------------------------------
+    # TRAINING CURVES
+    # --------------------------------------------------------
+
+    plot_model_training_curves(
+        step_history=step_history,
+        epoch_history=epoch_history,
+        dataset_name=dataset_name,
+        output_dir=analysis_dir,
+    )
+
+    # --------------------------------------------------------
+    # SUMMARY / METADATA
+    # --------------------------------------------------------
+
+    last_epoch = epoch_history[-1]
 
     summary = {
-        "model_name": model_name,
+        "model_name": one_config["models"]["name"],
         "dataset_name": dataset_name,
-        "dataset_size": training_cfg.get("dataset_size"),
-        "batch_size": training_cfg.get("batch_size"),
-        "context_length": training_cfg.get("context_length"),
-        "gradient_accumulation_steps": training_cfg.get("gradient_accumulation_steps"),
-        "effective_batch_size": training_cfg.get("batch_size") * training_cfg.get("gradient_accumulation_steps", 1),
-        "learning_rate": training_cfg.get("learning_rate"),
-        "weight_decay": training_cfg.get("weight_decay"),
-        "seed": seed,
+        "model_dir": model_dir,
 
-        "max_epochs": max_epochs,
-        "patience": patience,
-        "min_delta": min_delta,
-        "epochs_run": epochs_run,
-        "best_epoch": best_epoch + 1,
-        "best_val_loss": best_val_loss,
-        "best_val_ppl": val_ppls[best_epoch],
-        "best_val_acc": val_accs[best_epoch],
-        "stopping_reason": stopping_reason,
-        "history_path": history_path,
-        "model_dir": model_dir,  ###
+        "seed": training_cfg["seed"],
+        "context_length": training_cfg["context_length"],
+        "max_tokens": training_cfg["max_tokens"],
+        "batch_size": training_cfg["batch_size"],
+        "gradient_accumulation_steps":
+            training_cfg["gradient_accumulation_steps"],
+        "effective_batch_size":
+            training_cfg["batch_size"]
+            * training_cfg["gradient_accumulation_steps"],
+
+        "max_epochs": training_cfg["max_epochs"],
+
+        "num_documents_used":
+            dataset_stats["num_documents_used"],
+        "raw_tokens_seen":
+            dataset_stats["raw_tokens_seen"],
+        "num_sequences":
+            dataset_stats["num_sequences"],
+        "effective_tokens":
+            dataset_stats["effective_tokens"],
+
+        "num_train_sequences": num_train_sequences,
+        "num_val_sequences": num_val_sequences,
+
+        "final_optimizer_step":
+            last_epoch["optimizer_step"],
+        "final_tokens_seen":
+            last_epoch["cumulative_tokens_seen"],
+
+        "final_train_loss":
+            last_epoch["train_loss"],
+        "final_val_loss":
+            last_epoch["val_loss"],
+        "final_train_ppl":
+            last_epoch["train_ppl"],
+        "final_val_ppl":
+            last_epoch["val_ppl"],
+        "final_train_acc":
+            last_epoch["train_acc"],
+        "final_val_acc":
+            last_epoch["val_acc"],
+
+        "step_history_path": step_history_path,
+        "epoch_history_path": epoch_history_path,
     }
-    summary_df = pd.DataFrame([summary])
-    summary_path = os.path.join(analysis_dir, "training_summary.csv")
-    summary_df.to_csv(summary_path, index=False)
 
-    metadata_path = os.path.join(
-             model_dir,
-             "metadata.pth",
-         )  ###
+    summary_path = os.path.join(
+        analysis_dir,
+        "training_summary.csv",
+    )
+
+    pd.DataFrame([summary]).to_csv(
+        summary_path,
+        index=False,
+    )
 
     torch.save(
-             {
-                 **summary,
-                 "dataset_config": dataset_cfg,
-                 "training_config": training_cfg,
-             },
-             metadata_path,
-         )  ###
+        {
+            **summary,
+            "dataset_config": dataset_cfg,
+            "training_config": training_cfg,
+        },
+        os.path.join(model_dir, "metadata.pth"),
+    )
 
-    print(
-            f"Training analysis saved at: {analysis_dir}",
-            flush=True,
+    # --------------------------------------------------------
+    # CLEAN GPU
+    # --------------------------------------------------------
+
+    del model
+    del optimizer
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return summary   
+
+def erm_model_exists(dataset_name):
+    """Check whether a complete saved ERM model already exists."""
+
+    dataset_dir = os.path.join("outputs", "erm_baselines", dataset_name.replace(" ", "_"))
+
+    model_dir = os.path.join(dataset_dir, "model")
+
+    model_exists = (
+        os.path.isfile(
+            os.path.join(
+                model_dir,
+                "config.json",
+            )
         )
+        and (
+            os.path.isfile(
+                os.path.join(
+                    model_dir,
+                    "model.safetensors",
+                )
+            )
+            or os.path.isfile(
+                os.path.join(
+                    model_dir,
+                    "pytorch_model.bin",
+                )
+            )
+        )
+    )
 
-    print(
-             f"Best model and tokenizer saved at: {model_dir}",
-             flush=True,
-         )  ###
+    return model_exists
 
-    return summary
-    
+def load_existing_erm_summary(dataset_name):
+    """Load the training summary of an already trained ERM model."""
+
+    summary_path = os.path.join(
+        "outputs",
+        "erm_baselines",
+        dataset_name.replace(" ", "_"),
+        "training_analysis",
+        "training_summary.csv",
+    )
+
+    if not os.path.isfile(summary_path):
+        return None
+
+    summary_df = pd.read_csv(summary_path)
+
+    if len(summary_df) == 0:
+        return None
+
+    return summary_df.iloc[0].to_dict()
 
 def run_erm_baselines(datasets_config, device):
     """Train one oracle ERM model for each deployment dataset."""
+
     save_path = "outputs/erm_baselines"
     os.makedirs(save_path, exist_ok=True)
 
@@ -420,18 +488,78 @@ def run_erm_baselines(datasets_config, device):
     results = []
 
     for one_config in one_configs:
+        dataset_name = one_config["dataset_name"]
 
-        result = train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta= 0.001)
+        # ----------------------------------------------------
+        # REUSE EXISTING MODEL
+        # ----------------------------------------------------
 
+        if erm_model_exists(dataset_name):
+            model_dir = os.path.join(
+                save_path,
+                dataset_name.replace(" ", "_"),
+                "model",
+            )
+            print(
+                f"\n[{dataset_name}] Existing ERM model found: "
+                f"{model_dir}",
+                flush=True,
+            )
+            print(
+                "Skipping training.",
+                flush=True,
+            )
+            existing_summary = (
+                load_existing_erm_summary(
+                    dataset_name
+                )
+            )
+            if existing_summary is not None:
+                results.append(existing_summary)
+
+            else:
+                print(
+                    f"WARNING: model exists for "
+                    f"{dataset_name}, but no "
+                    "training_summary.csv was found.",
+                    flush=True,
+                )
+            continue
+
+        # ----------------------------------------------------
+        # TRAIN MODEL
+        # ----------------------------------------------------
+
+        result = train_one_erm_model(one_config, device)
         results.append(result)
 
-    df = pd.DataFrame(results)
+        # ----------------------------------------------------
+        # SAVE GLOBAL METADATA AFTER EACH MODEL
+        # ----------------------------------------------------
 
-    csv_path = os.path.join(save_path, "oracle_erm_models_metadata.csv")
-    df.to_csv(csv_path, index=False)
+        df = pd.DataFrame(results)
+        csv_path = os.path.join(save_path, "oracle_erm_models_metadata.csv")
+        df.to_csv(csv_path, index=False)
 
-    # print(" ERM Model bank training completed.", flush=True)
-    print(f"Metadata saved at: {csv_path}", flush=True)
+        print(
+            f"Metadata updated: {csv_path}",
+            flush=True,
+        )
+
+    # --------------------------------------------------------
+    # FINAL METADATA
+    # --------------------------------------------------------
+
+    if results:
+        df = pd.DataFrame(results)
+        csv_path = os.path.join(save_path, "oracle_erm_models_metadata.csv")
+        df.to_csv(csv_path, index=False)
+
+        print(
+            f"\nFinal metadata saved at: "
+            f"{csv_path}",
+            flush=True,
+        )
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

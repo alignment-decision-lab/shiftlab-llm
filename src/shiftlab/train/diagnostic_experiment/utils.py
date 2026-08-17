@@ -122,12 +122,6 @@ def create_shift_datasets(dataset, config, seed):
 
     return clean_reference_dataset, close_dataset, mid_dataset, far_dataset
 
-def tokenize_dataset(dataset, tokenizer, config):
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=config["training"]["context_length"])
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names)
-    return tokenized_dataset
-
 def tokenize_and_group_dataset(
     dataset,
     tokenizer,
@@ -537,21 +531,6 @@ def create_training_dataloaders(
         train_step_eval_dataloader,
     )
 
-    
-
-def create_probe_dataloader(val_dataset, data_collator, batch_size, probe_seed, probe_size=None):
-    if probe_size is None:
-        probe_size = len(val_dataset)
-    probe_size = min(probe_size, len(val_dataset))
-
-    generator = torch.Generator().manual_seed(probe_seed)
-    indices = torch.randperm(len(val_dataset), generator=generator)[:probe_size]
-
-    probe_dataset = Subset(val_dataset, indices.tolist())
-    probe_dataloader = DataLoader(probe_dataset, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
-
-    return probe_dataloader
-
 # ------- METRICS -------
 
 def compute_sample_losses(model, tokenized_dataset, data_collator, device, config):
@@ -648,57 +627,9 @@ def compute_shift_severity(config, clean_dataset, shifted_dataset, data_collator
 
 # ------- TRAINING -------
 
-def train_one_epoch(model, train_dataloader, optimizer, device):
-    model.train()
-    total_loss = 0
-
-    for batch in train_dataloader:
-        batch = move_batch_to_device(batch, device)
-
-        optimizer.zero_grad()
-        outputs = model(**batch)
-        loss = outputs.loss
-
-        total_loss += loss.item()
-
-        loss.backward()
-        optimizer.step()
-
-    avg_loss = total_loss / len(train_dataloader)
-
-    return avg_loss
-
-def train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accumulation_steps, scheduler=None):
-    if accumulation_steps <= 0:
-        raise ValueError("accumulation_steps must be a positive integer.")
-    model.train()
-    total_loss = 0
-    num_batches = len(train_dataloader)
-    optimizer.zero_grad(set_to_none=True)  # Initialize the gradients to zero
-    for i, batch in enumerate(train_dataloader):
-        batch = move_batch_to_device(batch, device)
-
-        outputs = model(**batch)
-        loss = outputs.loss 
-        total_loss += loss.item()
-
-        group_start = (i // accumulation_steps) * accumulation_steps
-        current_group_size = min(accumulation_steps, num_batches - group_start)
-
-        scaled_loss = loss / current_group_size  # Scale the loss by the number of steps in the current group
-        scaled_loss.backward()  # Accumulate gradients
-
-        is_end_of_group = ( (i + 1) % accumulation_steps == 0)
-        is_last_batch = (i == num_batches - 1)
-
-        if is_end_of_group or is_last_batch:
-            optimizer.step()  # Update model parameters
-            if scheduler is not None:
-                scheduler.step()  # Update learning rate
-            optimizer.zero_grad(set_to_none=True)  # Reset gradients to zero
-
-    avg_loss = total_loss / num_batches
-    return avg_loss
+# ============================================================
+# ERM TRAINING WITH STEP LOGGING - FIXED NUMBER OF EPOCHS
+# ============================================================
 
 def train_with_step_logging(
     model,
@@ -712,32 +643,83 @@ def train_with_step_logging(
     eval_every_optimizer_steps=10,
     eval_first_epoch_only=True,
     max_epochs=10,
+    scheduler=None,
 ):
+    """
+    Train an ERM model for a fixed number of epochs.
+
+    Logs:
+        - optimizer steps,
+        - cumulative number of tokens seen,
+        - train CE loss,
+        - validation CE loss.
+
+    Frequent step-level evaluation can optionally be restricted
+    to the first epoch, but optimizer steps and tokens are counted
+    during the entire training.
+
+    Returns
+    -------
+    step_history : list of dict
+        Fine-grained evaluations indexed by optimizer step.
+
+    epoch_history : list of dict
+        Full train/validation evaluations after each epoch.
+    """
+
+    if accumulation_steps <= 0:
+        raise ValueError(
+            "accumulation_steps must be a positive integer."
+        )
+
     global_step = 0
     cumulative_tokens_seen = 0
 
     step_history = []
     epoch_history = []
 
-    # ---------- STEP 0 ----------
-    train_loss, train_ppl, train_acc, _ = evaluation(model, train_step_eval_dataloader, device=device)
+    # --------------------------------------------------------
+    # STEP 0
+    # --------------------------------------------------------
 
-    val_loss, val_ppl, val_acc, _ = evaluation(model, val_dataloader, device=device)
+    train_loss, train_ppl, train_acc, _ = evaluation(
+        model,
+        train_step_eval_dataloader,
+        device=device,
+    )
 
-    step_history.append({
-        "optimizer_step": 0,
-        "cumulative_tokens_seen": 0,
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-    })
+    val_loss, val_ppl, val_acc, _ = evaluation(
+        model,
+        val_dataloader,
+        device=device,
+    )
+
+    step_history.append(
+        {
+            "optimizer_step": 0,
+            "cumulative_tokens_seen": 0,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_ppl": train_ppl,
+            "val_ppl": val_ppl,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+    )
 
     optimizer.zero_grad(set_to_none=True)
 
-    # ---------- TRAINING ----------
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
+
     for epoch in range(max_epochs):
+
         model.train()
 
         num_batches = len(train_optim_dataloader)
+        total_optimization_loss = 0.0
 
         for i, batch in enumerate(train_optim_dataloader):
 
@@ -746,457 +728,1309 @@ def train_with_step_logging(
             outputs = model(**batch)
             loss = outputs.loss
 
-            # Count actual tokens seen.
-            cumulative_tokens_seen += batch["attention_mask"].sum().item() # Count the number of tokens seen in the current batch and add it to the cumulative count.
+            total_optimization_loss += loss.item()
 
-            # Same accumulation logic as the previous validated training function.
-            group_start = i // accumulation_steps * accumulation_steps
-            current_group_size = min(accumulation_steps, num_batches - group_start)
+            # Count the actual number of tokens processed.
+            if "attention_mask" in batch:
+                cumulative_tokens_seen += (
+                    batch["attention_mask"].sum().item()
+                )
+            else:
+                cumulative_tokens_seen += (
+                    batch["input_ids"].numel()
+                )
+
+            # ------------------------------------------------
+            # GRADIENT ACCUMULATION
+            # ------------------------------------------------
+
+            group_start = (
+                i // accumulation_steps
+            ) * accumulation_steps
+
+            current_group_size = min(
+                accumulation_steps,
+                num_batches - group_start,
+            )
 
             scaled_loss = loss / current_group_size
             scaled_loss.backward()
 
-            is_end_of_group =( (i + 1) % accumulation_steps == 0 )
-            is_last_batch = ( i == num_batches - 1 )
+            is_end_of_group = (
+                (i + 1) % accumulation_steps == 0
+            )
+
+            is_last_batch = (
+                i == num_batches - 1
+            )
 
             if is_end_of_group or is_last_batch:
+
                 optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
                 optimizer.zero_grad(set_to_none=True)
 
-                global_step += 1 # Count the number of optimizer steps taken.
+                global_step += 1
 
-                # Fine-grained evaluation:
-                if (
-                    (not eval_first_epoch_only or epoch == 0)
-                    and global_step % eval_every_optimizer_steps == 0
-                ): # To evaluate every few optimizer steps.
-                    train_loss, train_ppl, train_acc, _ = evaluation(model, train_step_eval_dataloader, device=device)
-                    val_loss, val_ppl, val_acc, _ = evaluation(model, val_dataloader, device=device)
+                # --------------------------------------------
+                # FINE-GRAINED STEP EVALUATION
+                # --------------------------------------------
 
-                    step_history.append({
-                        "optimizer_step": global_step,
-                        "cumulative_tokens_seen": cumulative_tokens_seen,
-                        "train_loss": train_loss,
-                        "val_loss": val_loss,
-                    })
+                should_evaluate = (
+                    global_step % eval_every_optimizer_steps == 0
+                    and (
+                        not eval_first_epoch_only
+                        or epoch == 0
+                    )
+                )
+
+                if should_evaluate:
+
+                    step_train_loss, step_train_ppl, step_train_acc, _ = (
+                        evaluation(
+                            model,
+                            train_step_eval_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_val_loss, step_val_ppl, step_val_acc, _ = (
+                        evaluation(
+                            model,
+                            val_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_history.append(
+                        {
+                            "optimizer_step": global_step,
+                            "cumulative_tokens_seen": cumulative_tokens_seen,
+                            "train_loss": step_train_loss,
+                            "val_loss": step_val_loss,
+                            "train_ppl": step_train_ppl,
+                            "val_ppl": step_val_ppl,
+                            "train_acc": step_train_acc,
+                            "val_acc": step_val_acc,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                        }
+                    )
+
                     model.train()
 
-        # ---------- END OF EPOCH ----------
-        train_loss, train_ppl, train_acc, _ = evaluation(model, train_dataloader, device=device)
-        val_loss, val_ppl, val_acc, _ = evaluation(model, val_dataloader, device=device)
-        if not eval_first_epoch_only or epoch == 0:
-            if step_history[-1]["optimizer_step"] != global_step:
+        # ----------------------------------------------------
+        # END-OF-EPOCH EVALUATION
+        # ----------------------------------------------------
 
-                step_train_loss, _, _, _ = evaluation(model, train_step_eval_dataloader, device=device)
+        train_loss, train_ppl, train_acc, train_tokens = evaluation(
+            model,
+            train_dataloader,
+            device=device,
+        )
 
-                step_history.append({
+        val_loss, val_ppl, val_acc, val_tokens = evaluation(
+            model,
+            val_dataloader,
+            device=device,
+        )
+
+        avg_optimization_loss = (
+            total_optimization_loss / num_batches
+        )
+
+        epoch_history.append(
+            {
+                "epoch": epoch + 1,
+                "optimizer_step": global_step,
+                "cumulative_tokens_seen": cumulative_tokens_seen,
+                "optimization_loss": avg_optimization_loss,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_ppl": train_ppl,
+                "val_ppl": val_ppl,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "train_eval_tokens": train_tokens,
+                "val_eval_tokens": val_tokens,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+
+        # Also keep the end of each epoch in step_history.
+        if step_history[-1]["optimizer_step"] != global_step:
+
+            step_history.append(
+                {
                     "optimizer_step": global_step,
                     "cumulative_tokens_seen": cumulative_tokens_seen,
-                    "train_loss": step_train_loss,
+                    "train_loss": train_loss,
                     "val_loss": val_loss,
-                })
-
-        epoch_history.append({
-            "epoch": epoch + 1,
-            "optimizer_step": global_step,
-            "cumulative_tokens_seen": cumulative_tokens_seen,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-        })
+                    "train_ppl": train_ppl,
+                    "val_ppl": val_ppl,
+                    "train_acc": train_acc,
+                    "val_acc": val_acc,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
 
         print(
             f"Epoch {epoch + 1}/{max_epochs} | "
             f"step={global_step} | "
             f"tokens={cumulative_tokens_seen:,} | "
+            f"optim_loss={avg_optimization_loss:.4f} | "
             f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f}",
+            f"val_loss={val_loss:.4f} | "
+            f"val_ppl={val_ppl:.2f}",
             flush=True,
         )
 
     return step_history, epoch_history
 
+# ============================================================
+# ERM TRAINING WITH STEP LOGGING + EARLY STOPPING
+# ============================================================
 
-def KL_DRO_one_epoch(model, train_dataloader, optimizer, gamma, lambd, rho, device):
-    model.train()
-    total_mix_loss = 0
-    loss_function = torch.nn.CrossEntropyLoss(reduction="none")
+def train_with_step_logging_early_stopping(
+    model,
+    train_optim_dataloader,
+    train_dataloader,
+    val_dataloader,
+    train_step_eval_dataloader,
+    optimizer,
+    device,
+    accumulation_steps,
+    eval_every_optimizer_steps=10,
+    eval_first_epoch_only=True,
+    max_epochs=30,
+    patience=3,
+    min_delta=0.0,
+    scheduler=None,
+):
+    """
+    ERM training with optimizer-step/token logging and early stopping.
 
-    for batch in train_dataloader:
-        batch = move_batch_to_device(batch, device)
+    Early stopping is based on the standard validation
+    cross-entropy loss.
 
-        optimizer.zero_grad()
-        outputs = model(**batch)
+    At the end, the model is restored to the checkpoint
+    with the lowest validation loss.
+    """
 
-        avg_loss = outputs.loss
-
-        # Compute Kl-DRO Loss:
-        logits = outputs.logits
-        labels = batch["labels"]
-
-        logits = logits[:, :-1, :] #shifted.
-        labels = labels[:, 1:]
-
-        mask = labels != -100
-
-        logits = logits.reshape(-1, logits.size(-1))# logits:(batch, sequence_length, vocab_size) -> (batch*sequence_length, vocab_size)
-        labels = labels.reshape(-1) # labels:(batch, sequence_length) -> (batch*sequence_length)
-
-        token_losses = loss_function(logits, labels) # loss per token
-        token_losses = token_losses.reshape(batch["input_ids"].size(0), -1) # reshape back to (batch, sequence_length)
-        token_losses = token_losses * mask # puting the pad loss to 0.
-
-        sample_loss = token_losses.sum(dim=1) / mask.sum(dim=1)
-
-        log_mean_exp = torch.logsumexp(sample_loss / lambd, dim=0) - torch.log(
-        torch.tensor(len(sample_loss), device=device, dtype=sample_loss.dtype)
-        )
-
-        dro_loss = lambd * log_mean_exp + lambd * rho
-
-        # Compute Mix_loss:
-        mix_loss = (1 - gamma) * avg_loss + gamma * dro_loss
-
-        total_mix_loss += mix_loss.item()
-
-        mix_loss.backward() 
-        optimizer.step()
-    
-    avg_mix_loss = total_mix_loss / len(train_dataloader)
-    return avg_mix_loss
-
-def KL_DRO_one_epoch_accumulated(model, train_dataloader, optimizer, gamma, lambd, rho, device, accumulation_steps):
     if accumulation_steps <= 0:
-        raise ValueError("accumulation_steps must be a positive integer.")
-    model.train()
-    total_mix_loss = 0
-    num_batches = len(train_dataloader)
-    optimizer.zero_grad(set_to_none=True)  # Initialize the gradients to zero
-    loss_function = torch.nn.CrossEntropyLoss(reduction="none")
-
-    for i, batch in enumerate(train_dataloader):
-        batch = move_batch_to_device(batch, device)
-
-        outputs = model(**batch)
-
-        avg_loss = outputs.loss
-
-        # Compute Kl-DRO Loss:
-        logits = outputs.logits
-        labels = batch["labels"]
-
-        logits = logits[:, :-1, :] #shifted.
-        labels = labels[:, 1:]
-
-        mask = labels != -100
-
-        logits = logits.reshape(-1, logits.size(-1))# logits:(batch, sequence_length, vocab_size) -> (batch*sequence_length, vocab_size)
-        labels = labels.reshape(-1) # labels:(batch, sequence_length) -> (batch*sequence_length)
-
-        token_losses = loss_function(logits, labels) # loss per token
-        token_losses = token_losses.reshape(batch["input_ids"].size(0), -1) # reshape back to (batch, sequence_length)
-        token_losses = token_losses * mask # puting the pad loss to 0.
-
-        sample_loss = token_losses.sum(dim=1) / mask.sum(dim=1)
-
-        log_mean_exp = torch.logsumexp(sample_loss / lambd, dim=0) - torch.log(
-            torch.tensor(len(sample_loss), device=device, dtype=sample_loss.dtype)
+        raise ValueError(
+            "accumulation_steps must be a positive integer."
         )
 
-        dro_loss = lambd * log_mean_exp + lambd * rho
-
-        # Compute Mix_loss:
-        mix_loss = (1 - gamma) * avg_loss + gamma * dro_loss
-
-        total_mix_loss += mix_loss.item()
-
-        group_start = (i // accumulation_steps) * accumulation_steps
-        current_group_size = min(accumulation_steps, num_batches - group_start)
-
-        scaled_mix_loss = mix_loss / current_group_size  # Scale the loss by the number of steps in the current group
-        scaled_mix_loss.backward()  # Accumulate gradients
-
-        is_end_of_group = ( (i + 1) % accumulation_steps == 0)
-        is_last_batch = (i == num_batches - 1)
-
-        if is_end_of_group or is_last_batch:
-            optimizer.step()  # Update model parameters
-            optimizer.zero_grad(set_to_none=True)  # Reset gradients to zero
-    avg_mix_loss = total_mix_loss / num_batches
-    return avg_mix_loss
-
-
-def train_method(method_name, train_dataloader, val_dataloader, clean_reference_dataset, close_dataset,
-                mid_dataset, far_dataset, data_collator, device, config):
-
-    print(f"\n===== Training {method_name} =====", flush=True)
-
-    model, _, _ = setup_model_and_tokenizer(config, device)
-    method_config = config["methods"][method_name]
-
-    optimizer = optim.AdamW(
-            model.parameters(),
-            lr=float(config["training"]["learning_rate"]),
-            weight_decay=float(config["training"].get("weight_decay", 0.0))
+    if patience <= 0:
+        raise ValueError(
+            "patience must be a positive integer."
         )
-    
 
-    train_losses = []
-    val_losses = []
-    val_perplexities = []
-    val_accuracies = []
+    global_step = 0
+    cumulative_tokens_seen = 0
 
-    for epoch in range(config["training"]["epochs"]):
+    step_history = []
+    epoch_history = []
 
-        if method_config["type"] == "ERM":
-            train_loss = train_one_epoch(model, train_dataloader, optimizer, device)
-        else:
-            lambd = method_config["lambda"]
-            train_loss = KL_DRO_one_epoch(
-                    model,
-                    train_dataloader,
-                    optimizer,
-                    gamma=config["training"]["gamma"],
-                    lambd=lambd,
-                    rho=config["training"]["rho"],
-                    device=device
+    best_val_loss = float("inf")
+    best_epoch = None
+    best_optimizer_step = None
+    best_state_dict = None
+
+    epochs_without_improvement = 0
+
+    # --------------------------------------------------------
+    # STEP 0
+    # --------------------------------------------------------
+
+    train_loss, train_ppl, train_acc, _ = evaluation(
+        model,
+        train_step_eval_dataloader,
+        device=device,
+    )
+
+    val_loss, val_ppl, val_acc, _ = evaluation(
+        model,
+        val_dataloader,
+        device=device,
+    )
+
+    step_history.append(
+        {
+            "optimizer_step": 0,
+            "cumulative_tokens_seen": 0,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_ppl": train_ppl,
+            "val_ppl": val_ppl,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
+
+    for epoch in range(max_epochs):
+
+        model.train()
+
+        num_batches = len(train_optim_dataloader)
+        total_optimization_loss = 0.0
+
+        for i, batch in enumerate(train_optim_dataloader):
+
+            batch = move_batch_to_device(batch, device)
+
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            total_optimization_loss += loss.item()
+
+            if "attention_mask" in batch:
+                cumulative_tokens_seen += (
+                    batch["attention_mask"].sum().item()
                 )
-        val_loss, val_ppl, val_acc = evaluation(model, val_dataloader, device)
+            else:
+                cumulative_tokens_seen += (
+                    batch["input_ids"].numel()
+                )
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_perplexities.append(val_ppl)
-        val_accuracies.append(val_acc)
+            group_start = (
+                i // accumulation_steps
+            ) * accumulation_steps
+
+            current_group_size = min(
+                accumulation_steps,
+                num_batches - group_start,
+            )
+
+            scaled_loss = loss / current_group_size
+            scaled_loss.backward()
+
+            is_end_of_group = (
+                (i + 1) % accumulation_steps == 0
+            )
+
+            is_last_batch = (
+                i == num_batches - 1
+            )
+
+            if is_end_of_group or is_last_batch:
+
+                optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+
+                should_evaluate = (
+                    global_step % eval_every_optimizer_steps == 0
+                    and (
+                        not eval_first_epoch_only
+                        or epoch == 0
+                    )
+                )
+
+                if should_evaluate:
+
+                    step_train_loss, step_train_ppl, step_train_acc, _ = (
+                        evaluation(
+                            model,
+                            train_step_eval_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_val_loss, step_val_ppl, step_val_acc, _ = (
+                        evaluation(
+                            model,
+                            val_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_history.append(
+                        {
+                            "optimizer_step": global_step,
+                            "cumulative_tokens_seen": cumulative_tokens_seen,
+                            "train_loss": step_train_loss,
+                            "val_loss": step_val_loss,
+                            "train_ppl": step_train_ppl,
+                            "val_ppl": step_val_ppl,
+                            "train_acc": step_train_acc,
+                            "val_acc": step_val_acc,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                        }
+                    )
+
+                    model.train()
+
+        # ----------------------------------------------------
+        # END-OF-EPOCH EVALUATION
+        # ----------------------------------------------------
+
+        train_loss, train_ppl, train_acc, train_tokens = evaluation(
+            model,
+            train_dataloader,
+            device=device,
+        )
+
+        val_loss, val_ppl, val_acc, val_tokens = evaluation(
+            model,
+            val_dataloader,
+            device=device,
+        )
+
+        avg_optimization_loss = (
+            total_optimization_loss / num_batches
+        )
+
+        epoch_history.append(
+            {
+                "epoch": epoch + 1,
+                "optimizer_step": global_step,
+                "cumulative_tokens_seen": cumulative_tokens_seen,
+                "optimization_loss": avg_optimization_loss,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_ppl": train_ppl,
+                "val_ppl": val_ppl,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "train_eval_tokens": train_tokens,
+                "val_eval_tokens": val_tokens,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+
+        if step_history[-1]["optimizer_step"] != global_step:
+            step_history.append(
+                {
+                    "optimizer_step": global_step,
+                    "cumulative_tokens_seen": cumulative_tokens_seen,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_ppl": train_ppl,
+                    "val_ppl": val_ppl,
+                    "train_acc": train_acc,
+                    "val_acc": val_acc,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
 
         print(
-                f"[{method_name}] Epoch {epoch+1}/{config['training']['epochs']} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Val PPL: {val_ppl:.2f} | "
-                f"Val Acc: {val_acc:.4f}",
-                flush=True
+            f"Epoch {epoch + 1}/{max_epochs} | "
+            f"step={global_step} | "
+            f"tokens={cumulative_tokens_seen:,} | "
+            f"optim_loss={avg_optimization_loss:.4f} | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | "
+            f"val_ppl={val_ppl:.2f}",
+            flush=True,
+        )
+
+        # ----------------------------------------------------
+        # EARLY STOPPING
+        # ----------------------------------------------------
+
+        if val_loss < best_val_loss - min_delta:
+
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_optimizer_step = global_step
+
+            # Store the best model on CPU so we do not duplicate
+            # the complete GPT-2 model in GPU memory.
+            best_state_dict = {
+                name: param.detach().cpu().clone()
+                for name, param in model.state_dict().items()
+            }
+
+            epochs_without_improvement = 0
+
+            print(
+                f"New best validation loss: "
+                f"{best_val_loss:.4f} "
+                f"(epoch={best_epoch}, "
+                f"step={best_optimizer_step})",
+                flush=True,
             )
-    # Because of the randomness of the dataset creation and batch sampling, we evaluate on multiple seeds.
-    all_eval_results = []
-    for seed in config["diagnostic"]["evaluation_seeds"]:
 
-        eval_results = evaluate_scenarios(
-            model,
-            close_dataset,
-            mid_dataset,
-            far_dataset,
-            clean_reference_dataset,
-            data_collator,
-            device,
-            config,
-            seed
-        )
-        all_eval_results.append(eval_results)
-    
-    scenario_names = config["diagnostic"]["scenario_names"]
-    aggregated_results = {}
-    for scenario_name in scenario_names:
-        mean_losses = [eval_result[scenario_name]["mean_loss"] for eval_result in all_eval_results]
-        tail_losses = [eval_result[scenario_name]["tail_loss"] for eval_result in all_eval_results]
-        degradations = [eval_result[scenario_name]["degradation"] for eval_result in all_eval_results]
-        sample_losses_all_seeds = [eval_result[scenario_name]["sample_losses"] for eval_result in all_eval_results]
+        else:
 
-        aggregated_results[scenario_name] = {
-            "mean_losses": mean_losses,
-            "tail_losses": tail_losses,
-            "degradations": degradations,
-            "sample_losses_all_seeds": sample_losses_all_seeds,
-            # Mean:
-            "mean_loss_mean": np.mean(mean_losses),
-            "tail_loss_mean": np.mean(tail_losses),
-            "degradation_mean": np.mean(degradations),
-            # Ecart-type:
-            "mean_loss_std": np.std(mean_losses),
-            "tail_loss_std": np.std(tail_losses),
-            "degradation_std": np.std(degradations)
-        }
+            epochs_without_improvement += 1
 
+            print(
+                f"No validation improvement for "
+                f"{epochs_without_improvement}/{patience} epoch(s).",
+                flush=True,
+            )
 
-    results = {
-            "train_losses": train_losses,
-            "val_losses": val_losses,
-            "val_perplexities": val_perplexities,
-            "val_accuracies": val_accuracies,
-            "eval": aggregated_results
-        }
+            if epochs_without_improvement >= patience:
 
-    return results
+                print(
+                    f"Early stopping at epoch {epoch + 1}. "
+                    f"Best epoch={best_epoch}, "
+                    f"best step={best_optimizer_step}, "
+                    f"best val loss={best_val_loss:.4f}.",
+                    flush=True,
+                )
 
+                break
 
+    # --------------------------------------------------------
+    # RESTORE BEST CHECKPOINT
+    # --------------------------------------------------------
 
-# ------- EVALUATION SCENARIOS -------
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
 
-def evaluate_scenarios(model, close_dataset, mid_dataset, far_dataset, clean_reference_dataset,
-                        data_collator, device, config, seed):
-
-    alphas = config["diagnostic"]["alpha_k"]
-    betas = config["diagnostic"]["beta_k"]
-    scenario_names = config["diagnostic"]["scenario_names"]
-
-    eval_results = {}
-
-    ID_losses = compute_sample_losses(
-            model,
-            clean_reference_dataset,
-            data_collator,
-            device,
-            config
-        )
-
-    for i, scenario_name in enumerate(scenario_names):
-
-        alpha = alphas[i]
-        beta = betas[i]
-
-        test_dataset = create_three_way_mixture_dataset(
-            close_dataset,
-            mid_dataset,
-            far_dataset,
-            alpha,
-            beta,
-            config["diagnostic"]["test_size"],
-            seed
-        )
-
-        OOD_losses = compute_sample_losses(
-            model,
-            test_dataset,
-            data_collator,
-            device,
-            config
-        )
-
-        mean_loss = sum(OOD_losses) / len(OOD_losses)
-        tail_loss = compute_tail_loss(OOD_losses, tail_ratio=0.1)
-        delta = np.mean(OOD_losses) - np.mean(ID_losses)
-
-        eval_results[scenario_name] = {
-            "mean_loss": mean_loss,
-            "tail_loss": tail_loss,
-            "sample_losses": OOD_losses,
-            "degradation": delta
-        }
-
-    return eval_results
-
-
-# ------- GRAPHS -------
-
-def plot_training_curves(results, config):
-    output_dir = config["outputs"]["dir"]
-    os.makedirs(output_dir, exist_ok=True)
-
-    losses = results["ERM"]["train_losses"]
-    epochs = range(1, len(losses) + 1)
-
-
-    plt.figure(figsize=(16, 10))
-
-    plt.subplot(1, 3, 1)
-    for model_name, model_results in results.items():
-        plt.plot(epochs, model_results["train_losses"], label=f"{model_name} Training Loss")
-        plt.plot(epochs, model_results["val_losses"], label=f"{model_name} Validation Loss", linestyle='dashed')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-
-    plt.subplot(1, 3, 2)
-    for model_name, model_results in results.items():
-        plt.plot(epochs, model_results["val_perplexities"], label=f"{model_name} Validation Perplexity")
-    plt.xlabel('Epochs')
-    plt.ylabel('Perplexity')
-    plt.title('Validation Perplexity')
-    plt.legend()
-
-    plt.subplot(1, 3, 3)
-    for model_name, model_results in results.items():
-        plt.plot(epochs, model_results["val_accuracies"], label=f"{model_name} Validation Accuracy")
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-    plt.title('Validation Accuracy')
-    plt.legend()
-
-    plt.tight_layout()
-    
-    plt.savefig(f"{output_dir}/performance_curves.png")
-    plt.close()
-
-def plot_shift_visual(results, config):
-    output_dir = config["outputs"]["dir"]
-    os.makedirs(output_dir, exist_ok=True)
-
-    scenarios = list(results["ERM"]["eval"].keys())
-
-    plt.figure(figsize=(18, 12))
-    for i, scenario in enumerate(scenarios):
-        plt.subplot(1, 4, i+1)
-        all_sample_losses = []
-        for losses in results["ERM"]["eval"][scenario]["sample_losses_all_seeds"]:
-            all_sample_losses.extend(losses)
-        plt.hist(all_sample_losses, bins=30, alpha=0.35, label="ERM Sample Losses")
-        plt.xlabel("Sample loss")
-        plt.ylabel("Frequency")
-        plt.title(f"Loss Distribution for {scenario} Scenario")
-        plt.legend()
-
-    plt.subplot(1, 4, 4)
-    plt.plot(np.arange(len(scenarios)), [results["ERM"]["eval"][scenario]["degradation_mean"] for scenario in scenarios], marker='o', label="ERM Degradation Δ")
-    plt.xticks(np.arange(len(scenarios)), scenarios)
-    plt.xlabel("Scenarios")
-    plt.ylabel("Degradation Δ")
-    plt.title("Degradation Δ by Scenario")
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/shift_visualization.png")
-    plt.close()
-
-def plot_robustness_boxplots(results, config):
-    output_dir = config["outputs"]["dir"]
-    os.makedirs(output_dir, exist_ok=True)
-
-    scenarios = list(results["ERM"]["eval"].keys())
-    method_names = list(results.keys())
-    metrics = {
-        "Mean loss": ("mean_loss_mean", "mean_loss_std"),
-        "Tail loss": ("tail_loss_mean", "tail_loss_std"),
-        "Degradation Δ": ("degradation_mean", "degradation_std"),
+    best_info = {
+        "best_epoch": best_epoch,
+        "best_optimizer_step": best_optimizer_step,
+        "best_val_loss": best_val_loss,
     }
 
-    plt.figure(figsize=(18, 8))
-    bar_width = 0.18
-    x = np.arange(len(scenarios))
+    return step_history, epoch_history, best_info
 
-    for plot_idx, (metric_title, (mean_key, std_key)) in enumerate(metrics.items()):
-        plt.subplot(1, 3, plot_idx + 1)
 
-        for method_idx, method in enumerate(method_names):
-            means = [results[method]["eval"][scenario][mean_key] for scenario in scenarios]
-            stds = [results[method]["eval"][scenario][std_key] for scenario in scenarios]
+# ============================================================
+# KL-DRO TRAINING WITH STEP LOGGING - FIXED EPOCHS
+# ============================================================
 
-            positions = x + method_idx * bar_width
-            if method == "ERM":
-                label = "ERM"
+def KL_DRO_train_with_step_logging(
+    model,
+    train_optim_dataloader,
+    train_dataloader,
+    val_dataloader,
+    train_step_eval_dataloader,
+    optimizer,
+    gamma,
+    lambd,
+    rho,
+    device,
+    accumulation_steps,
+    eval_every_optimizer_steps=10,
+    eval_first_epoch_only=True,
+    max_epochs=10,
+    scheduler=None,
+):
+    """
+    Train a KL-DRO model for a fixed number of epochs.
+
+    If lambda == 0, standard ERM training is used.
+
+    Training objective:
+        mix_loss =
+            (1 - gamma) * ERM_loss
+            + gamma * DRO_loss
+
+    where:
+        DRO_loss =
+            lambda * logmeanexp(sample_loss / lambda)
+            + lambda * rho
+
+    Train/validation curves are always standard CE losses so
+    that all lambda models are directly comparable.
+    """
+
+    # --------------------------------------------------------
+    # lambda = 0 -> ERM
+    # --------------------------------------------------------
+
+    if lambd == 0 or lambd == 0.0:
+
+        print(
+            "\nλ=0 -> standard ERM training.",
+            flush=True,
+        )
+
+        return train_with_step_logging(
+            model=model,
+            train_optim_dataloader=train_optim_dataloader,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            train_step_eval_dataloader=train_step_eval_dataloader,
+            optimizer=optimizer,
+            device=device,
+            accumulation_steps=accumulation_steps,
+            eval_every_optimizer_steps=eval_every_optimizer_steps,
+            eval_first_epoch_only=eval_first_epoch_only,
+            max_epochs=max_epochs,
+            scheduler=scheduler,
+        )
+
+    if lambd < 0:
+        raise ValueError(
+            "lambda must be >= 0."
+        )
+
+    if accumulation_steps <= 0:
+        raise ValueError(
+            "accumulation_steps must be a positive integer."
+        )
+
+    global_step = 0
+    cumulative_tokens_seen = 0
+
+    step_history = []
+    epoch_history = []
+
+    loss_function = torch.nn.CrossEntropyLoss(
+        reduction="none",
+        ignore_index=-100,
+    )
+
+    # --------------------------------------------------------
+    # STEP 0
+    # --------------------------------------------------------
+
+    train_loss, train_ppl, train_acc, _ = evaluation(
+        model,
+        train_step_eval_dataloader,
+        device=device,
+    )
+
+    val_loss, val_ppl, val_acc, _ = evaluation(
+        model,
+        val_dataloader,
+        device=device,
+    )
+
+    step_history.append(
+        {
+            "optimizer_step": 0,
+            "cumulative_tokens_seen": 0,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_ppl": train_ppl,
+            "val_ppl": val_ppl,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
+
+    for epoch in range(max_epochs):
+
+        model.train()
+
+        num_batches = len(train_optim_dataloader)
+
+        total_mix_loss = 0.0
+        total_erm_component = 0.0
+        total_dro_component = 0.0
+
+        for i, batch in enumerate(train_optim_dataloader):
+
+            batch = move_batch_to_device(batch, device)
+
+            outputs = model(**batch)
+
+            # Standard autoregressive CE averaged over valid tokens.
+            avg_loss = outputs.loss
+
+            logits = outputs.logits
+            labels = batch["labels"]
+
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            batch_size = shift_logits.size(0)
+
+            flat_logits = shift_logits.view(
+                -1,
+                shift_logits.size(-1),
+            )
+
+            flat_labels = shift_labels.view(-1)
+
+            token_losses = loss_function(
+                flat_logits,
+                flat_labels,
+            )
+
+            token_losses = token_losses.view(
+                batch_size,
+                -1,
+            )
+
+            valid_mask = (
+                shift_labels != -100
+            ).float()
+
+            # Mean CE for each sequence.
+            valid_tokens_per_sample = (
+                valid_mask.sum(dim=1).clamp_min(1.0)
+            )
+
+            sample_losses = (
+                token_losses.sum(dim=1)
+                / valid_tokens_per_sample
+            )
+
+            # -----------------------------------------------
+            # KL-DRO objective
+            # -----------------------------------------------
+
+            log_mean_exp = (
+                torch.logsumexp(
+                    sample_losses / lambd,
+                    dim=0,
+                )
+                - math.log(sample_losses.numel())
+            )
+
+            dro_loss = (
+                lambd * log_mean_exp
+                + lambd * rho
+            )
+
+            mix_loss = (
+                (1.0 - gamma) * avg_loss
+                + gamma * dro_loss
+            )
+
+            total_mix_loss += mix_loss.item()
+            total_erm_component += avg_loss.item()
+            total_dro_component += dro_loss.item()
+
+            if "attention_mask" in batch:
+                cumulative_tokens_seen += (
+                    batch["attention_mask"].sum().item()
+                )
             else:
-                lambd = config["methods"][method]["lambda"]
-                label = f"λ={lambd}"
-            
-            plt.bar(positions, means, width=bar_width, label=label,yerr=stds, capsize=4, ecolor="black", error_kw={"elinewidth": 1.5, "capthick": 1.5})
+                cumulative_tokens_seen += (
+                    batch["input_ids"].numel()
+                )
 
-        plt.xticks(x + bar_width * (len(method_names)-1) / 2, scenarios, rotation=15)
-        plt.ylabel(metric_title)
-        plt.title(f"{metric_title} across seeds")
-        if plot_idx == 0:
-            plt.legend()
+            # ------------------------------------------------
+            # GRADIENT ACCUMULATION
+            # ------------------------------------------------
 
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/robustness_boxplots.png")
-    plt.close()
+            group_start = (
+                i // accumulation_steps
+            ) * accumulation_steps
+
+            current_group_size = min(
+                accumulation_steps,
+                num_batches - group_start,
+            )
+
+            scaled_loss = (
+                mix_loss / current_group_size
+            )
+
+            scaled_loss.backward()
+
+            is_end_of_group = (
+                (i + 1) % accumulation_steps == 0
+            )
+
+            is_last_batch = (
+                i == num_batches - 1
+            )
+
+            if is_end_of_group or is_last_batch:
+
+                optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+
+                should_evaluate = (
+                    global_step % eval_every_optimizer_steps == 0
+                    and (
+                        not eval_first_epoch_only
+                        or epoch == 0
+                    )
+                )
+
+                if should_evaluate:
+
+                    step_train_loss, step_train_ppl, step_train_acc, _ = (
+                        evaluation(
+                            model,
+                            train_step_eval_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_val_loss, step_val_ppl, step_val_acc, _ = (
+                        evaluation(
+                            model,
+                            val_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_history.append(
+                        {
+                            "optimizer_step": global_step,
+                            "cumulative_tokens_seen": cumulative_tokens_seen,
+                            "train_loss": step_train_loss,
+                            "val_loss": step_val_loss,
+                            "train_ppl": step_train_ppl,
+                            "val_ppl": step_val_ppl,
+                            "train_acc": step_train_acc,
+                            "val_acc": step_val_acc,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                        }
+                    )
+
+                    model.train()
+
+        # ----------------------------------------------------
+        # END-OF-EPOCH STANDARD CE EVALUATION
+        # ----------------------------------------------------
+
+        train_loss, train_ppl, train_acc, train_tokens = evaluation(
+            model,
+            train_dataloader,
+            device=device,
+        )
+
+        val_loss, val_ppl, val_acc, val_tokens = evaluation(
+            model,
+            val_dataloader,
+            device=device,
+        )
+
+        avg_mix_loss = (
+            total_mix_loss / num_batches
+        )
+
+        avg_erm_component = (
+            total_erm_component / num_batches
+        )
+
+        avg_dro_component = (
+            total_dro_component / num_batches
+        )
+
+        epoch_history.append(
+            {
+                "epoch": epoch + 1,
+                "optimizer_step": global_step,
+                "cumulative_tokens_seen": cumulative_tokens_seen,
+
+                "optimization_loss": avg_mix_loss,
+                "erm_component": avg_erm_component,
+                "dro_component": avg_dro_component,
+
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+
+                "train_ppl": train_ppl,
+                "val_ppl": val_ppl,
+
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+
+                "train_eval_tokens": train_tokens,
+                "val_eval_tokens": val_tokens,
+
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+
+        if step_history[-1]["optimizer_step"] != global_step:
+
+            step_history.append(
+                {
+                    "optimizer_step": global_step,
+                    "cumulative_tokens_seen": cumulative_tokens_seen,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_ppl": train_ppl,
+                    "val_ppl": val_ppl,
+                    "train_acc": train_acc,
+                    "val_acc": val_acc,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
+
+        print(
+            f"[λ={lambd}] "
+            f"Epoch {epoch + 1}/{max_epochs} | "
+            f"step={global_step} | "
+            f"tokens={cumulative_tokens_seen:,} | "
+            f"mix_loss={avg_mix_loss:.4f} | "
+            f"ERM_component={avg_erm_component:.4f} | "
+            f"DRO_component={avg_dro_component:.4f} | "
+            f"train_CE={train_loss:.4f} | "
+            f"val_CE={val_loss:.4f} | "
+            f"val_ppl={val_ppl:.2f}",
+            flush=True,
+        )
+
+    return step_history, epoch_history
+
+# ============================================================
+# KL-DRO TRAINING WITH STEP LOGGING + EARLY STOPPING
+# ============================================================
+
+def KL_DRO_train_with_step_logging_early_stopping(
+    model,
+    train_optim_dataloader,
+    train_dataloader,
+    val_dataloader,
+    train_step_eval_dataloader,
+    optimizer,
+    gamma,
+    lambd,
+    rho,
+    device,
+    accumulation_steps,
+    eval_every_optimizer_steps=10,
+    eval_first_epoch_only=True,
+    max_epochs=30,
+    patience=3,
+    min_delta=0.0,
+    scheduler=None,
+):
+    """
+    KL-DRO training with step/token logging and early stopping.
+
+    If lambda == 0, standard ERM training with early stopping
+    is used.
+
+    Early stopping is based on standard validation CE loss.
+    The best checkpoint is restored before returning.
+    """
+
+    # --------------------------------------------------------
+    # lambda = 0 -> ERM
+    # --------------------------------------------------------
+
+    if lambd == 0 or lambd == 0.0:
+
+        print(
+            "\nλ=0 -> standard ERM training with early stopping.",
+            flush=True,
+        )
+
+        return train_with_step_logging_early_stopping(
+            model=model,
+            train_optim_dataloader=train_optim_dataloader,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            train_step_eval_dataloader=train_step_eval_dataloader,
+            optimizer=optimizer,
+            device=device,
+            accumulation_steps=accumulation_steps,
+            eval_every_optimizer_steps=eval_every_optimizer_steps,
+            eval_first_epoch_only=eval_first_epoch_only,
+            max_epochs=max_epochs,
+            patience=patience,
+            min_delta=min_delta,
+            scheduler=scheduler,
+        )
+
+    if lambd < 0:
+        raise ValueError(
+            "lambda must be >= 0."
+        )
+
+    if accumulation_steps <= 0:
+        raise ValueError(
+            "accumulation_steps must be a positive integer."
+        )
+
+    if patience <= 0:
+        raise ValueError(
+            "patience must be a positive integer."
+        )
+
+    global_step = 0
+    cumulative_tokens_seen = 0
+
+    step_history = []
+    epoch_history = []
+
+    best_val_loss = float("inf")
+    best_epoch = None
+    best_optimizer_step = None
+    best_state_dict = None
+
+    epochs_without_improvement = 0
+
+    loss_function = torch.nn.CrossEntropyLoss(
+        reduction="none",
+        ignore_index=-100,
+    )
+
+    # --------------------------------------------------------
+    # STEP 0
+    # --------------------------------------------------------
+
+    train_loss, train_ppl, train_acc, _ = evaluation(
+        model,
+        train_step_eval_dataloader,
+        device=device,
+    )
+
+    val_loss, val_ppl, val_acc, _ = evaluation(
+        model,
+        val_dataloader,
+        device=device,
+    )
+
+    step_history.append(
+        {
+            "optimizer_step": 0,
+            "cumulative_tokens_seen": 0,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_ppl": train_ppl,
+            "val_ppl": val_ppl,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
+
+    for epoch in range(max_epochs):
+
+        model.train()
+
+        num_batches = len(train_optim_dataloader)
+
+        total_mix_loss = 0.0
+        total_erm_component = 0.0
+        total_dro_component = 0.0
+
+        for i, batch in enumerate(train_optim_dataloader):
+
+            batch = move_batch_to_device(
+                batch,
+                device,
+            )
+
+            outputs = model(**batch)
+
+            avg_loss = outputs.loss
+
+            logits = outputs.logits
+            labels = batch["labels"]
+
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            batch_size = shift_logits.size(0)
+
+            flat_logits = shift_logits.view(
+                -1,
+                shift_logits.size(-1),
+            )
+
+            flat_labels = shift_labels.view(-1)
+
+            token_losses = loss_function(
+                flat_logits,
+                flat_labels,
+            )
+
+            token_losses = token_losses.view(
+                batch_size,
+                -1,
+            )
+
+            valid_mask = (
+                shift_labels != -100
+            ).float()
+
+            valid_tokens_per_sample = (
+                valid_mask.sum(dim=1).clamp_min(1.0)
+            )
+
+            sample_losses = (
+                token_losses.sum(dim=1)
+                / valid_tokens_per_sample
+            )
+
+            log_mean_exp = (
+                torch.logsumexp(
+                    sample_losses / lambd,
+                    dim=0,
+                )
+                - math.log(sample_losses.numel())
+            )
+
+            dro_loss = (
+                lambd * log_mean_exp
+                + lambd * rho
+            )
+
+            mix_loss = (
+                (1.0 - gamma) * avg_loss
+                + gamma * dro_loss
+            )
+
+            total_mix_loss += mix_loss.item()
+            total_erm_component += avg_loss.item()
+            total_dro_component += dro_loss.item()
+
+            if "attention_mask" in batch:
+                cumulative_tokens_seen += (
+                    batch["attention_mask"].sum().item()
+                )
+            else:
+                cumulative_tokens_seen += (
+                    batch["input_ids"].numel()
+                )
+
+            group_start = (
+                i // accumulation_steps
+            ) * accumulation_steps
+
+            current_group_size = min(
+                accumulation_steps,
+                num_batches - group_start,
+            )
+
+            scaled_loss = (
+                mix_loss / current_group_size
+            )
+
+            scaled_loss.backward()
+
+            is_end_of_group = (
+                (i + 1) % accumulation_steps == 0
+            )
+
+            is_last_batch = (
+                i == num_batches - 1
+            )
+
+            if is_end_of_group or is_last_batch:
+
+                optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+
+                should_evaluate = (
+                    global_step % eval_every_optimizer_steps == 0
+                    and (
+                        not eval_first_epoch_only
+                        or epoch == 0
+                    )
+                )
+
+                if should_evaluate:
+
+                    step_train_loss, step_train_ppl, step_train_acc, _ = (
+                        evaluation(
+                            model,
+                            train_step_eval_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_val_loss, step_val_ppl, step_val_acc, _ = (
+                        evaluation(
+                            model,
+                            val_dataloader,
+                            device=device,
+                        )
+                    )
+
+                    step_history.append(
+                        {
+                            "optimizer_step": global_step,
+                            "cumulative_tokens_seen": cumulative_tokens_seen,
+                            "train_loss": step_train_loss,
+                            "val_loss": step_val_loss,
+                            "train_ppl": step_train_ppl,
+                            "val_ppl": step_val_ppl,
+                            "train_acc": step_train_acc,
+                            "val_acc": step_val_acc,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                        }
+                    )
+
+                    model.train()
+
+        # ----------------------------------------------------
+        # END-OF-EPOCH EVALUATION
+        # ----------------------------------------------------
+
+        train_loss, train_ppl, train_acc, train_tokens = evaluation(
+            model,
+            train_dataloader,
+            device=device,
+        )
+
+        val_loss, val_ppl, val_acc, val_tokens = evaluation(
+            model,
+            val_dataloader,
+            device=device,
+        )
+
+        avg_mix_loss = (
+            total_mix_loss / num_batches
+        )
+
+        avg_erm_component = (
+            total_erm_component / num_batches
+        )
+
+        avg_dro_component = (
+            total_dro_component / num_batches
+        )
+
+        epoch_history.append(
+            {
+                "epoch": epoch + 1,
+                "optimizer_step": global_step,
+                "cumulative_tokens_seen": cumulative_tokens_seen,
+
+                "optimization_loss": avg_mix_loss,
+                "erm_component": avg_erm_component,
+                "dro_component": avg_dro_component,
+
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+
+                "train_ppl": train_ppl,
+                "val_ppl": val_ppl,
+
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+
+                "train_eval_tokens": train_tokens,
+                "val_eval_tokens": val_tokens,
+
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+
+        if step_history[-1]["optimizer_step"] != global_step:
+
+            step_history.append(
+                {
+                    "optimizer_step": global_step,
+                    "cumulative_tokens_seen": cumulative_tokens_seen,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_ppl": train_ppl,
+                    "val_ppl": val_ppl,
+                    "train_acc": train_acc,
+                    "val_acc": val_acc,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
+
+        print(
+            f"[λ={lambd}] "
+            f"Epoch {epoch + 1}/{max_epochs} | "
+            f"step={global_step} | "
+            f"tokens={cumulative_tokens_seen:,} | "
+            f"mix_loss={avg_mix_loss:.4f} | "
+            f"ERM_component={avg_erm_component:.4f} | "
+            f"DRO_component={avg_dro_component:.4f} | "
+            f"train_CE={train_loss:.4f} | "
+            f"val_CE={val_loss:.4f} | "
+            f"val_ppl={val_ppl:.2f}",
+            flush=True,
+        )
+
+        # ----------------------------------------------------
+        # EARLY STOPPING
+        # ----------------------------------------------------
+
+        if val_loss < best_val_loss - min_delta:
+
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_optimizer_step = global_step
+
+            best_state_dict = {
+                name: param.detach().cpu().clone()
+                for name, param in model.state_dict().items()
+            }
+
+            epochs_without_improvement = 0
+
+            print(
+                f"[λ={lambd}] New best validation loss: "
+                f"{best_val_loss:.4f} "
+                f"(epoch={best_epoch}, "
+                f"step={best_optimizer_step})",
+                flush=True,
+            )
+
+        else:
+
+            epochs_without_improvement += 1
+
+            print(
+                f"[λ={lambd}] No validation improvement for "
+                f"{epochs_without_improvement}/{patience} epoch(s).",
+                flush=True,
+            )
+
+            if epochs_without_improvement >= patience:
+
+                print(
+                    f"[λ={lambd}] Early stopping at "
+                    f"epoch {epoch + 1}. "
+                    f"Best epoch={best_epoch}, "
+                    f"best step={best_optimizer_step}, "
+                    f"best val loss={best_val_loss:.4f}.",
+                    flush=True,
+                )
+
+                break
+
+    # --------------------------------------------------------
+    # RESTORE BEST CHECKPOINT
+    # --------------------------------------------------------
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    best_info = {
+        "best_epoch": best_epoch,
+        "best_optimizer_step": best_optimizer_step,
+        "best_val_loss": best_val_loss,
+    }
+
+    return step_history, epoch_history, best_info
+
+# ------- GRAPHS -------
 
 def plot_comparison_curve(
     df,
