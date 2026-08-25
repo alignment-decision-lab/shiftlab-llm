@@ -104,30 +104,39 @@ def load_pg19_dataset(config):
     dataset = load_dataset(
         config["dataset"]["name"],
         split=config["dataset"]["split"],
-        streaming=config["dataset"].get("streaming", False)
+        streaming=config["dataset"].get("streaming", False),
     )
 
     if config["dataset"].get("cleaning") == "basic":
         dataset = dataset.map(clean_pg19_text)
 
     if config["dataset"]["text_column"] != "text":
-        dataset = dataset.rename_column(config["dataset"]["text_column"], "text")
+        dataset = dataset.rename_column(
+            config["dataset"]["text_column"],
+            "text",
+        )
 
-    dataset = dataset.filter(lambda x: len(x["text"].strip()) > 5)
+    dataset = dataset.filter(
+        lambda x: len(x["text"].strip()) > 5
+    )
 
-    dataset_size = config["training"].get("dataset_size")
+    dataset_offset = int(
+        config["training"].get("dataset_offset", 0)
+    )
 
-    if dataset_size is None:
-        dataset_size = config.get("diagnostic", {}).get("total_size")
+    if dataset_offset < 0:
+        raise ValueError(
+            "dataset_offset must be greater than or equal to 0."
+        )
 
-    if config["dataset"].get("streaming", False):
-        if dataset_size is not None:
-            dataset = dataset.take(dataset_size)
-        dataset = Dataset.from_list(list(dataset))
-
-    else:
-        if dataset_size is not None:
-            dataset = dataset.select(range(min(dataset_size, len(dataset))))
+    if dataset_offset > 0:
+        if config["dataset"].get("streaming", False):
+            dataset = dataset.skip(dataset_offset)
+        else:
+            start = min(dataset_offset, len(dataset))
+            dataset = dataset.select(
+                range(start, len(dataset))
+            )
 
     return dataset
 
@@ -220,44 +229,11 @@ def load_hf_text_dataset(config):
         config["dataset"]["name"],
         config["dataset"].get("config", None),
         split=config["dataset"]["split"],
-        streaming=config["dataset"].get("streaming", False),
+        streaming=config["dataset"].get(
+            "streaming",
+            False,
+        ),
     )
-
-    dataset_size = config["training"].get("dataset_size")
-    dataset_offset = int(
-        config["training"].get("dataset_offset", 0)
-    )
-
-    if dataset_offset < 0:
-        raise ValueError(
-            "dataset_offset must be greater than or equal to 0."
-        )
-
-    if config["dataset"].get("streaming", False):
-        if dataset_size is None:
-            raise ValueError(
-                "dataset_size must be provided when streaming=True"
-            )
-
-        if dataset_offset > 0:
-            dataset = dataset.skip(dataset_offset)
-
-        dataset = dataset.take(dataset_size)
-
-        # Convert the finite iterable into a standard Hugging Face Dataset.
-        dataset = Dataset.from_list(list(dataset))
-
-    else:
-        if dataset_size is not None:
-            start = min(dataset_offset, len(dataset))
-            end = min(
-                dataset_offset + dataset_size,
-                len(dataset),
-            )
-
-            dataset = dataset.select(
-                range(start, end)
-            )
 
     if config["dataset"]["text_column"] != "text":
         dataset = dataset.rename_column(
@@ -265,11 +241,52 @@ def load_hf_text_dataset(config):
             "text",
         )
 
-    dataset = dataset.map(normalize_text_column)
+    dataset = dataset.map(
+        normalize_text_column
+    )
 
     dataset = dataset.filter(
         lambda x: len(x["text"].strip()) > 5
     )
+
+    dataset_offset = int(
+        config["training"].get(
+            "dataset_offset",
+            0,
+        )
+    )
+
+    if dataset_offset < 0:
+        raise ValueError(
+            "dataset_offset must be >= 0."
+        )
+
+    # IMPORTANT:
+    # Apply the offset AFTER normalization/filtering,
+    # so that it has the same meaning as
+    # num_documents_used.
+    if dataset_offset > 0:
+
+        if config["dataset"].get(
+            "streaming",
+            False,
+        ):
+            dataset = dataset.skip(
+                dataset_offset
+            )
+
+        else:
+            start = min(
+                dataset_offset,
+                len(dataset),
+            )
+
+            dataset = dataset.select(
+                range(
+                    start,
+                    len(dataset),
+                )
+            )
 
     return dataset
 

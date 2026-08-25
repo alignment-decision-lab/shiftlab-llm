@@ -1,4 +1,4 @@
-from datasets import load_dataset
+from datasets import load_dataset, get_dataset_config_names
 import re
 
 
@@ -243,11 +243,21 @@ if __name__ == "__main__":
     # streaming=True
     # )
 
+    # try_load_and_inspect(
+    # dataset_id="PleIAs/Post-OCR-Correction",
+    # name="Post-OCR Correction",
+    # config="french",
+    # split="train",
+    # text_column="text",
+    # streaming=True
+    # )
+
+# ---------- OpenWebText2 (The Pile) ----------
+
     try_load_and_inspect(
-    dataset_id="PleIAs/Post-OCR-Correction",
-    name="Post-OCR Correction",
-    config="french",
-    split="train",
+    dataset_id="suolyer/pile_openwebtext2",
+    name="OpenWebText2 (The Pile)",
+    split="validation",
     text_column="text",
-    streaming=True
-    )
+    streaming=True,
+)
