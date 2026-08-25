@@ -1,5 +1,10 @@
 # First experiment with DistilGPT-2(82M parameters) using Wikisource Dataset.
 
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from datasets import load_dataset, Dataset, concatenate_datasets
 from itertools import islice
 from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForLanguageModeling
@@ -14,6 +19,7 @@ import yaml
 import argparse
 import re
 import random
+import plotting
 
 def load_config():
     parser = argparse.ArgumentParser()
@@ -61,15 +67,89 @@ def clean_wikisource_text(example):
     example["text"] = text.strip()
     return example
 
-def load_wikisource_dataset(config):
-    dataset = load_dataset(config["dataset"]["name"], config["dataset"]["config"])
-    dataset = dataset["train"]
+_VALID_CLEANING_MODES = {"none", "wikisource", "basic"}
 
-    if config["dataset"]["cleaning"] == "wikisource":
+
+def _resolve_max_length(config):
+    """Resolve the tokenization sequence length.
+
+    Requires the canonical 'max_length' key, but tolerates the older
+    'context_length' name (used by one legacy config) with a visible
+    warning instead of a silent KeyError deep in tokenization.
+    """
+    training_cfg = config["training"]
+
+    if "max_length" in training_cfg:
+        return training_cfg["max_length"]
+
+    if "context_length" in training_cfg:
+        print(
+            "[config] 'training.context_length' is deprecated, use "
+            "'training.max_length' instead. Using it as max_length for now."
+        )
+        return training_cfg["context_length"]
+
+    raise ValueError(
+        "config['training'] must define 'max_length' (the tokenization "
+        "sequence length in tokens). Found neither 'max_length' nor the "
+        "deprecated 'context_length'."
+    )
+
+
+def _load_raw_dataset(dataset_cfg):
+    """Load the raw HF dataset, supporting the two loading modes used across
+    configs/diagnostic/{wikitext,wikisource,histtext}/:
+
+    - hub name + config name (wikitext, wikisource): load_dataset(name, config)
+    - hub name + data_files glob (histtext):         load_dataset(name, data_files=...)
+
+    These two modes are mutually exclusive in the HF `datasets` API, so a
+    config that sets both is almost certainly a mistake and is rejected
+    rather than silently picking one.
+    """
+    name = dataset_cfg["name"]
+    config_name = dataset_cfg.get("config")
+    data_files = dataset_cfg.get("data_files")
+
+    if config_name is not None and data_files is not None:
+        raise ValueError(
+            f"config['dataset'] for {name!r} sets both 'config' and "
+            "'data_files' -- these are mutually exclusive loading modes, "
+            "pick one."
+        )
+
+    if data_files is not None:
+        return load_dataset(name, data_files=data_files)
+
+    return load_dataset(name, config_name)
+
+
+def load_difficulty_shift_dataset(config):
+    """Load and prepare the training corpus for a difficulty-shift run.
+
+    This is the single generic loader for every dataset family under
+    configs/diagnostic/{wikitext,wikisource,histtext}/. Dataset-specific
+    behavior (e.g. wikisource markup cleaning) is controlled by
+    config['dataset']['cleaning'], not by a separate function per dataset
+    despite what this function used to be named.
+    """
+    dataset_cfg = config["dataset"]
+
+    cleaning = dataset_cfg.get("cleaning", "none")
+    if cleaning not in _VALID_CLEANING_MODES:
+        raise ValueError(
+            f"config['dataset']['cleaning'] = {cleaning!r} is not one of "
+            f"{sorted(_VALID_CLEANING_MODES)} (dataset: {dataset_cfg.get('name')!r})."
+        )
+
+    dataset = _load_raw_dataset(dataset_cfg)
+    dataset = dataset[dataset_cfg.get("split", "train")]
+
+    if cleaning == "wikisource":
         dataset = dataset.map(clean_wikisource_text)
 
-    if config["dataset"]["text_column"] != "text":
-        dataset = dataset.rename_column(config["dataset"]["text_column"], "text")
+    if dataset_cfg["text_column"] != "text":
+        dataset = dataset.rename_column(dataset_cfg["text_column"], "text")
     dataset = dataset.filter(lambda x: len(x["text"]) > 5)
 
     if config["training"]["dataset_size"] is not None:
@@ -220,8 +300,9 @@ def run_training(config):
 
     
     tokenizer = load_tokenizer(config)
-    dataset = load_wikisource_dataset(config)
-    tokenized_dataset = tokenize_dataset(dataset, tokenizer, config["training"]["max_length"])
+    dataset = load_difficulty_shift_dataset(config)
+    max_length = _resolve_max_length(config)
+    tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length)
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     losses = compute_sample_losses(model, tokenized_dataset, data_collator, device, config)
     easy_dataset, hard_dataset = split_easy_hard(tokenized_dataset, losses, config["diagnostic"]["alpha"])
@@ -251,6 +332,10 @@ def run_training(config):
     val_losses = []
     val_perplexities = []
     val_accuracies = []
+    cumulative_steps = []
+    cumulative_tokens = []
+    total_steps = 0
+    total_tokens = 0
 
     test_betas = config["diagnostic"]["betas_test"]
     test_losses_by_epoch = {}
@@ -263,14 +348,16 @@ def run_training(config):
         model.train()
         total_loss = 0
         for batch in train_dataloader:
-            batch = move_batch_to_device(batch, device) 
+            batch = move_batch_to_device(batch, device)
             optimizer.zero_grad() # By default, gradients are accumulated in PyTorch, else gradients would be mixed up together accross batches. It does not suppress the learning.
             outputs = model(**batch) # compute the loss
             loss = outputs.loss
             total_loss += loss.item()
+            total_tokens += batch["input_ids"].numel()
             loss.backward() # Backpropagate the loss to compute the gradients of the model parameters with respect to the loss.
             optimizer.step() # Update the model parameters based on the computed gradients.
 
+        total_steps += len(train_dataloader)
         avg_loss = total_loss / len(train_dataloader)
         train_losses.append(avg_loss)
 
@@ -279,6 +366,8 @@ def run_training(config):
         val_losses.append(val_loss)
         val_perplexities.append(perplexity)
         val_accuracies.append(accuracy)
+        cumulative_steps.append(total_steps)
+        cumulative_tokens.append(total_tokens)
 
         print(
         f"Epoch {epoch+1}/{config['training']['epochs']} | "
@@ -327,6 +416,17 @@ def run_training(config):
     
 
     epochs = range(1, len(train_losses) + 1)
+
+    plotting.plot_training_loss_curves(
+        {config["models"]["name"]: {
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "cumulative_steps": cumulative_steps,
+            "cumulative_tokens": cumulative_tokens,
+        }},
+        output_dir="outputs",
+        filename_prefix="training_curves",
+    )
 
     plt.figure(figsize=(12, 5))
 

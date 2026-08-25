@@ -5,7 +5,7 @@ import pandas as pd
 import torch.optim as optim
 from shiftlab.data.load_datasets import load_dataset_from_subconfig
 import copy
-import matplotlib.pyplot as plt
+import plotting
 import time
 from torch.utils.data import DataLoader
 import math
@@ -155,52 +155,6 @@ def collect_erm_configs(datasets_config):
     return one_configs
 
 
-def plot_training_curves(results, dataset_name, output_dir):
-    """Plot ERM train and validation losses."""
-
-    epochs = range(
-        1,
-        len(results["train_losses"]) + 1,
-    )
-
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(
-        epochs,
-        results["train_losses"],
-        marker="o",
-        label="Train loss",
-    )
-
-    plt.plot(
-        epochs,
-        results["val_losses"],
-        marker="o",
-        label="Validation loss",
-    )
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(
-        f"ERM training curves for {dataset_name}"
-    )
-
-    plt.xticks(list(epochs))
-    plt.grid()
-    plt.legend()
-    plt.tight_layout()
-
-    plt.savefig(
-        os.path.join(
-            output_dir,
-            "training_curves.png",
-        ),
-        dpi=300,
-    )
-
-    plt.close()
-
-
 def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta= 0.001):
     """ Train an ERM model for a given dataset using early stopping. """
     dataset_cfg = one_config["dataset"]
@@ -275,14 +229,20 @@ def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta
     train_accs = []
     val_accs = []
     learning_rates = []
+    cumulative_steps = []
+    cumulative_tokens = []
+    total_steps = 0
+    total_tokens = 0
     best_val_loss = float("inf")
     best_epoch = 0
     epochs_without_improvement = 0
     stopping_reason = "max_epochs_reached"
 
     for epoch in range(max_epochs):
-        optim_loss = utils.train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accumulation_steps, scheduler)
+        optim_loss, num_steps, num_tokens = utils.train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accumulation_steps, scheduler)
         optim_losses.append(optim_loss)
+        total_steps += num_steps
+        total_tokens += num_tokens
         current_lr = optimizer.param_groups[0]['lr']
         learning_rates.append(current_lr)
         train_loss, train_ppl, train_acc, _ = utils.evaluation(model, train_eval_dataloader, device=device)
@@ -294,6 +254,8 @@ def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta
         val_ppls.append(val_ppl)
         train_accs.append(train_acc)
         val_accs.append(val_acc)
+        cumulative_steps.append(total_steps)
+        cumulative_tokens.append(total_tokens)
 
         improvement = best_val_loss - val_loss
 
@@ -334,6 +296,8 @@ def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta
 
     history_df = pd.DataFrame({
         "epoch": range(1, epochs_run + 1),
+        "cumulative_steps": cumulative_steps,
+        "cumulative_tokens": cumulative_tokens,
         "learning_rate": learning_rates,
         "optim_loss": optim_losses,
         "train_loss": train_losses,
@@ -353,8 +317,15 @@ def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta
         "val_ppls": val_ppls,
         "train_accs": train_accs,
         "val_accs": val_accs,
+        "cumulative_steps": cumulative_steps,
+        "cumulative_tokens": cumulative_tokens,
     }
-    plot_training_curves(results, dataset_name, analysis_dir)
+    training_curves_paths = plotting.plot_training_loss_curves(
+        {dataset_name: results},
+        output_dir=analysis_dir,
+        filename_prefix="training_curves",
+        title_prefix="ERM -- ",
+    )
 
     summary = {
         "model_name": model_name,
@@ -378,6 +349,9 @@ def train_one_erm_model(one_config, device, max_epochs=30, patience=3, min_delta
         "best_val_acc": val_accs[best_epoch],
         "stopping_reason": stopping_reason,
         "history_path": history_path,
+        "training_curves_by_epoch_path": training_curves_paths["epoch"],
+        "training_curves_by_step_path": training_curves_paths["step"],
+        "training_curves_by_token_path": training_curves_paths["token"],
         "model_dir": model_dir,  ###
     }
     summary_df = pd.DataFrame([summary])

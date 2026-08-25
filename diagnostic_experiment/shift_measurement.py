@@ -1,5 +1,5 @@
 from shiftlab.data.load_datasets import load_dataset_from_config
-from shiftlab.train.diagnostic_experiment import utils
+import utils
 import argparse
 import yaml
 import torch

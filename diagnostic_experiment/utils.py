@@ -10,6 +10,7 @@ from datasets import concatenate_datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForLanguageModeling
 import matplotlib.pyplot as plt
 import os
+import plotting
 
 
 # ------- GENERAL SETTINGS -------
@@ -372,8 +373,14 @@ def compute_shift_severity(config, clean_dataset, shifted_dataset, data_collator
 # ------- TRAINING -------
 
 def train_one_epoch(model, train_dataloader, optimizer, device):
+    """Run one training epoch.
+
+    Returns (avg_loss, num_steps, num_tokens) so callers can track loss
+    against optimizer steps and tokens processed, not just epoch index.
+    """
     model.train()
     total_loss = 0
+    num_tokens = 0
 
     for batch in train_dataloader:
         batch = move_batch_to_device(batch, device)
@@ -383,27 +390,36 @@ def train_one_epoch(model, train_dataloader, optimizer, device):
         loss = outputs.loss
 
         total_loss += loss.item()
+        num_tokens += batch["input_ids"].numel()
 
         loss.backward()
         optimizer.step()
 
-    avg_loss = total_loss / len(train_dataloader)
+    num_steps = len(train_dataloader)
+    avg_loss = total_loss / num_steps
 
-    return avg_loss
+    return avg_loss, num_steps, num_tokens
 
 def train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accumulation_steps, scheduler=None):
+    """Run one gradient-accumulated training epoch.
+
+    Returns (avg_loss, num_steps, num_tokens), where num_steps counts
+    optimizer.step() calls (i.e. accounting for accumulation), not batches.
+    """
     if accumulation_steps <= 0:
         raise ValueError("accumulation_steps must be a positive integer.")
     model.train()
     total_loss = 0
+    num_tokens = 0
     num_batches = len(train_dataloader)
     optimizer.zero_grad(set_to_none=True)  # Initialize the gradients to zero
     for i, batch in enumerate(train_dataloader):
         batch = move_batch_to_device(batch, device)
 
         outputs = model(**batch)
-        loss = outputs.loss 
+        loss = outputs.loss
         total_loss += loss.item()
+        num_tokens += batch["input_ids"].numel()
 
         group_start = (i // accumulation_steps) * accumulation_steps
         current_group_size = min(accumulation_steps, num_batches - group_start)
@@ -420,17 +436,24 @@ def train_one_epoch_accumulated(model, train_dataloader, optimizer, device, accu
                 scheduler.step()  # Update learning rate
             optimizer.zero_grad(set_to_none=True)  # Reset gradients to zero
 
+    num_steps = math.ceil(num_batches / accumulation_steps)
     avg_loss = total_loss / num_batches
-    return avg_loss
+    return avg_loss, num_steps, num_tokens
 
 
 def KL_DRO_one_epoch(model, train_dataloader, optimizer, gamma, lambd, rho, device):
+    """Run one KL-DRO training epoch.
+
+    Returns (avg_mix_loss, num_steps, num_tokens), mirroring train_one_epoch.
+    """
     model.train()
     total_mix_loss = 0
+    num_tokens = 0
     loss_function = torch.nn.CrossEntropyLoss(reduction="none")
 
     for batch in train_dataloader:
         batch = move_batch_to_device(batch, device)
+        num_tokens += batch["input_ids"].numel()
 
         optimizer.zero_grad()
         outputs = model(**batch)
@@ -466,23 +489,31 @@ def KL_DRO_one_epoch(model, train_dataloader, optimizer, gamma, lambd, rho, devi
 
         total_mix_loss += mix_loss.item()
 
-        mix_loss.backward() 
+        mix_loss.backward()
         optimizer.step()
-    
-    avg_mix_loss = total_mix_loss / len(train_dataloader)
-    return avg_mix_loss
+
+    num_steps = len(train_dataloader)
+    avg_mix_loss = total_mix_loss / num_steps
+    return avg_mix_loss, num_steps, num_tokens
 
 def KL_DRO_one_epoch_accumulated(model, train_dataloader, optimizer, gamma, lambd, rho, device, accumulation_steps):
+    """Run one gradient-accumulated KL-DRO training epoch.
+
+    Returns (avg_mix_loss, num_steps, num_tokens); num_steps counts
+    optimizer.step() calls, accounting for accumulation.
+    """
     if accumulation_steps <= 0:
         raise ValueError("accumulation_steps must be a positive integer.")
     model.train()
     total_mix_loss = 0
+    num_tokens = 0
     num_batches = len(train_dataloader)
     optimizer.zero_grad(set_to_none=True)  # Initialize the gradients to zero
     loss_function = torch.nn.CrossEntropyLoss(reduction="none")
 
     for i, batch in enumerate(train_dataloader):
         batch = move_batch_to_device(batch, device)
+        num_tokens += batch["input_ids"].numel()
 
         outputs = model(**batch)
 
@@ -529,8 +560,10 @@ def KL_DRO_one_epoch_accumulated(model, train_dataloader, optimizer, gamma, lamb
         if is_end_of_group or is_last_batch:
             optimizer.step()  # Update model parameters
             optimizer.zero_grad(set_to_none=True)  # Reset gradients to zero
+
+    num_steps = math.ceil(num_batches / accumulation_steps)
     avg_mix_loss = total_mix_loss / num_batches
-    return avg_mix_loss
+    return avg_mix_loss, num_steps, num_tokens
 
 
 def train_method(method_name, train_dataloader, val_dataloader, clean_reference_dataset, close_dataset,
@@ -552,14 +585,18 @@ def train_method(method_name, train_dataloader, val_dataloader, clean_reference_
     val_losses = []
     val_perplexities = []
     val_accuracies = []
+    cumulative_steps = []
+    cumulative_tokens = []
+    total_steps = 0
+    total_tokens = 0
 
     for epoch in range(config["training"]["epochs"]):
 
         if method_config["type"] == "ERM":
-            train_loss = train_one_epoch(model, train_dataloader, optimizer, device)
+            train_loss, num_steps, num_tokens = train_one_epoch(model, train_dataloader, optimizer, device)
         else:
             lambd = method_config["lambda"]
-            train_loss = KL_DRO_one_epoch(
+            train_loss, num_steps, num_tokens = KL_DRO_one_epoch(
                     model,
                     train_dataloader,
                     optimizer,
@@ -568,12 +605,17 @@ def train_method(method_name, train_dataloader, val_dataloader, clean_reference_
                     rho=config["training"]["rho"],
                     device=device
                 )
+        total_steps += num_steps
+        total_tokens += num_tokens
+
         val_loss, val_ppl, val_acc = evaluation(model, val_dataloader, device)
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         val_perplexities.append(val_ppl)
         val_accuracies.append(val_acc)
+        cumulative_steps.append(total_steps)
+        cumulative_tokens.append(total_tokens)
 
         print(
                 f"[{method_name}] Epoch {epoch+1}/{config['training']['epochs']} | "
@@ -629,6 +671,8 @@ def train_method(method_name, train_dataloader, val_dataloader, clean_reference_
             "val_losses": val_losses,
             "val_perplexities": val_perplexities,
             "val_accuracies": val_accuracies,
+            "cumulative_steps": cumulative_steps,
+            "cumulative_tokens": cumulative_tokens,
             "eval": aggregated_results
         }
 
@@ -695,25 +739,27 @@ def evaluate_scenarios(model, close_dataset, mid_dataset, far_dataset, clean_ref
 # ------- GRAPHS -------
 
 def plot_training_curves(results, config):
+    """Plot train/validation loss (vs. epoch, step, and token count) and
+    validation perplexity/accuracy (vs. epoch) for every method in `results`.
+
+    Loss curves are produced by the shared plotting module so this stays in
+    sync with every other training script instead of keeping its own copy.
+    """
     output_dir = config["outputs"]["dir"]
     os.makedirs(output_dir, exist_ok=True)
+
+    plotting.plot_training_loss_curves(
+        results,
+        output_dir,
+        filename_prefix="performance_curves_loss",
+    )
 
     losses = results["ERM"]["train_losses"]
     epochs = range(1, len(losses) + 1)
 
+    plt.figure(figsize=(11, 5))
 
-    plt.figure(figsize=(16, 10))
-
-    plt.subplot(1, 3, 1)
-    for model_name, model_results in results.items():
-        plt.plot(epochs, model_results["train_losses"], label=f"{model_name} Training Loss")
-        plt.plot(epochs, model_results["val_losses"], label=f"{model_name} Validation Loss", linestyle='dashed')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 2, 1)
     for model_name, model_results in results.items():
         plt.plot(epochs, model_results["val_perplexities"], label=f"{model_name} Validation Perplexity")
     plt.xlabel('Epochs')
@@ -721,7 +767,7 @@ def plot_training_curves(results, config):
     plt.title('Validation Perplexity')
     plt.legend()
 
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 2, 2)
     for model_name, model_results in results.items():
         plt.plot(epochs, model_results["val_accuracies"], label=f"{model_name} Validation Accuracy")
     plt.xlabel('Epochs')
@@ -730,7 +776,7 @@ def plot_training_curves(results, config):
     plt.legend()
 
     plt.tight_layout()
-    
+
     plt.savefig(f"{output_dir}/performance_curves.png")
     plt.close()
 

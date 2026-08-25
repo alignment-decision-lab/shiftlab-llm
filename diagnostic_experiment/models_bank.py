@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import shift_measurement as sm
 import lambda_window as lw
+import plotting
 import torch.optim as optim
 from shiftlab.data.load_datasets import load_dataset_from_subconfig
 from torch.utils.data import DataLoader
@@ -180,63 +181,6 @@ def prepare_one_source_dataset(config, dataset_name, dataset_config, device):
         "lambda_rho_curve_path": lambda_rho_curve_path,
     }
 
-import matplotlib.pyplot as plt
-
-
-def plot_training_curves(
-    results,
-    dataset_name,
-    lambda_,
-    output_dir,
-):
-    """Plot KL-DRO train and validation cross-entropy losses."""
-
-    epochs = range(
-        1,
-        len(results["train_losses"]) + 1,
-    )
-
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(
-        epochs,
-        results["train_losses"],
-        marker="o",
-        label="Train cross-entropy",
-    )
-
-    plt.plot(
-        epochs,
-        results["val_losses"],
-        marker="o",
-        label="Validation cross-entropy",
-    )
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Cross-entropy loss")
-    plt.title(
-        f"KL-DRO training curves for {dataset_name} "
-        f"(lambda={lambda_:g})"
-    )
-
-    plt.xticks(list(epochs))
-    plt.grid()
-    plt.legend()
-    plt.tight_layout()
-
-    output_path = os.path.join(
-        output_dir,
-        "training_curves.png",
-    )
-
-    plt.savefig(
-        output_path,
-        dpi=300,
-    )
-
-    plt.close()
-
-    return output_path
 
 def train_one_bank_model(one_config, source_info, config, device):
     """Train one KL-DRO model with early stopping."""
@@ -308,6 +252,10 @@ def train_one_bank_model(one_config, source_info, config, device):
     val_ppls = []
     train_accs = []
     val_accs = []
+    cumulative_steps = []
+    cumulative_tokens = []
+    total_steps = 0
+    total_tokens = 0
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -316,7 +264,7 @@ def train_one_bank_model(one_config, source_info, config, device):
 
     for epoch in range(max_epochs):
         if lambda_ == 0.0:
-            optim_loss = utils.train_one_epoch_accumulated(
+            optim_loss, num_steps, num_tokens = utils.train_one_epoch_accumulated(
                 model=model,
                 train_dataloader=train_dataloader,
                 optimizer=optimizer,
@@ -324,7 +272,7 @@ def train_one_bank_model(one_config, source_info, config, device):
                 accumulation_steps=accumulation_steps,
             )
         else:
-            optim_loss = utils.KL_DRO_one_epoch_accumulated(
+            optim_loss, num_steps, num_tokens = utils.KL_DRO_one_epoch_accumulated(
                 model=model,
                 train_dataloader=train_dataloader,
                 optimizer=optimizer,
@@ -334,6 +282,8 @@ def train_one_bank_model(one_config, source_info, config, device):
                 device=device,
                 accumulation_steps=accumulation_steps,
             )
+        total_steps += num_steps
+        total_tokens += num_tokens
 
         train_loss, train_ppl, train_acc, _ = utils.evaluation(model, train_eval_dataloader, device=device)
         val_loss, val_ppl, val_acc, _ = utils.evaluation(model, val_dataloader, device=device)
@@ -345,6 +295,8 @@ def train_one_bank_model(one_config, source_info, config, device):
         val_ppls.append(val_ppl)
         train_accs.append(train_acc)
         val_accs.append(val_acc)
+        cumulative_steps.append(total_steps)
+        cumulative_tokens.append(total_tokens)
 
         improvement = best_val_loss - val_loss
 
@@ -394,6 +346,8 @@ def train_one_bank_model(one_config, source_info, config, device):
     history_df = pd.DataFrame(
         {
             "epoch": range(1, epochs_run + 1),
+            "cumulative_steps": cumulative_steps,
+            "cumulative_tokens": cumulative_tokens,
             "optim_loss": optim_losses,
             "train_loss": train_losses,
             "val_loss": val_losses,
@@ -409,13 +363,15 @@ def train_one_bank_model(one_config, source_info, config, device):
     results = {
         "train_losses": train_losses,
         "val_losses": val_losses,
+        "cumulative_steps": cumulative_steps,
+        "cumulative_tokens": cumulative_tokens,
     }
 
-    training_curves_path = plot_training_curves(
-        results=results,
-        dataset_name=dataset_name,
-        lambda_=lambda_,
+    training_curves_paths = plotting.plot_training_loss_curves(
+        {dataset_name: results},
         output_dir=analysis_dir,
+        filename_prefix="training_curves",
+        title_prefix=f"KL-DRO (lambda={lambda_:g}) -- ",
     )
 
     summary = {
@@ -443,7 +399,9 @@ def train_one_bank_model(one_config, source_info, config, device):
         "stopping_reason": stopping_reason,
         "save_dir": save_dir,
         "history_path": history_path,
-        "training_curves_path": training_curves_path,
+        "training_curves_by_epoch_path": training_curves_paths["epoch"],
+        "training_curves_by_step_path": training_curves_paths["step"],
+        "training_curves_by_token_path": training_curves_paths["token"],
         "source_distribution_path": source_info["source_distribution_path"],
         "source_losses_path": source_info["source_losses_path"],
         "lambda_rho_curve_path": source_info["lambda_rho_curve_path"],

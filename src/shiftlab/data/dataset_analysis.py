@@ -1,10 +1,15 @@
-from shiftlab.train.diagnostic_experiment import shift_measurement
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parents[3] / "diagnostic_experiment"))
+
 from shiftlab.data.load_datasets import load_dataset_from_subconfig
 import torch
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 import os
 import pandas as pd
-from shiftlab.train.diagnostic_experiment import utils
+import shift_measurement
+import utils
 import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
