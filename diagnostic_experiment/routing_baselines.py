@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from algorithm_2 import load_model_bank_metadata
-from hierarchical_routing import compute_bank_batch_losses, compose_model
+from hierarchical_routing import compute_bank_batch_losses, compose_model, filter_trained_rows, load_bank_checkpoint
 from utils import move_batch_to_device
 
 
@@ -45,10 +45,10 @@ def _bank_candidate_name(row):
     return f"{row['dataset_name']}_lambda_{row['lambda']:g}"
 
 
-def _all_bank_losses(bank_df, pretrained_model_name, batch, device):
+def _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id=None):
     """Batch loss for every bank checkpoint plus theta_0, using the same
     naming convention as build_full_bank_candidates so the two line up."""
-    scored = compute_bank_batch_losses(bank_df, batch, device)
+    scored = compute_bank_batch_losses(bank_df, batch, device, bank_repo_id)
 
     names = [_bank_candidate_name(row) for _, row in scored.iterrows()]
     losses = scored["batch_loss"].tolist()
@@ -59,7 +59,7 @@ def _all_bank_losses(bank_df, pretrained_model_name, batch, device):
     return names, losses
 
 
-def build_full_bank_candidates(bank_df, pretrained_model_name, device):
+def build_full_bank_candidates(bank_df, pretrained_model_name, device, bank_repo_id=None):
     """Load every checkpoint in the bank (every source x lambda pair) plus
     theta_0, keyed by a unique candidate name.
 
@@ -75,7 +75,7 @@ def build_full_bank_candidates(bank_df, pretrained_model_name, device):
     del theta_0
 
     for _, row in bank_df.iterrows():
-        model = AutoModelForCausalLM.from_pretrained(row["save_dir"])
+        model = load_bank_checkpoint(row, bank_repo_id)
         candidates[_bank_candidate_name(row)] = {k: v.detach().clone() for k, v in model.state_dict().items()}
         del model
 
@@ -86,22 +86,27 @@ def build_full_bank_candidates(bank_df, pretrained_model_name, device):
 # Hard routing
 # ------------------------------------------------------------------
 
-def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, device):
+def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, device, bank_repo_id=None):
     """theta_B = argmin_{theta in M} L_hat_B(theta), M = {theta_0} U bank.
 
     No interpolation -- the single best-scoring checkpoint is returned as is.
+
+    bank_repo_id: if given, bank checkpoints are pulled from that Hub repo's
+    subfolders instead of local `save_dir` paths -- see
+    hierarchical_routing.load_bank_checkpoint().
     """
     batch = move_batch_to_device(batch, device)
     bank_df = load_model_bank_metadata(model_bank_metadata_path)
+    bank_df = filter_trained_rows(bank_df)
 
-    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device)
+    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id)
     best_idx = min(range(len(losses)), key=lambda i: losses[i])
     best_name, best_loss = names[best_idx], losses[best_idx]
 
     if best_name == "theta_0":
         theta_B = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
     else:
-        theta_B = AutoModelForCausalLM.from_pretrained(bank_df.iloc[best_idx]["save_dir"]).to(device)
+        theta_B = load_bank_checkpoint(bank_df.iloc[best_idx], bank_repo_id).to(device)
 
     info = {
         "selected": best_name,
@@ -115,17 +120,22 @@ def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, dev
 # Flat soft routing
 # ------------------------------------------------------------------
 
-def run_flat_routing(model_bank_metadata_path, batch, pretrained_model_name, device, tau=1.0):
+def run_flat_routing(model_bank_metadata_path, batch, pretrained_model_name, device, tau=1.0, bank_repo_id=None):
     """w_k(B) = softmax(-s_k(B)/tau) over every k in M = {theta_0} U bank;
     theta_B = sum_k w_k(B) theta_k. Closed-form, no iterative optimization.
+
+    bank_repo_id: if given, bank checkpoints are pulled from that Hub repo's
+    subfolders instead of local `save_dir` paths -- see
+    hierarchical_routing.load_bank_checkpoint().
     """
     batch = move_batch_to_device(batch, device)
     bank_df = load_model_bank_metadata(model_bank_metadata_path)
+    bank_df = filter_trained_rows(bank_df)
 
-    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device)
+    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id)
     weights = F.softmax(-torch.tensor(losses) / tau, dim=0)
 
-    candidates = build_full_bank_candidates(bank_df, pretrained_model_name, device)
+    candidates = build_full_bank_candidates(bank_df, pretrained_model_name, device, bank_repo_id)
     ordered_candidates = {name: candidates[name] for name in names}  # keep order aligned with weights
 
     model_template = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)

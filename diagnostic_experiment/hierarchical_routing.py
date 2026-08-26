@@ -53,10 +53,47 @@ DEFAULT_CONFIG = {
 
 
 # ------------------------------------------------------------------
+# Loading bank checkpoints -- either from local disk (models_bank.py's own
+# output, `save_dir` column) or from a Hub repo's subfolder (`subfolder`
+# column, e.g. the alignment-decision-lab/robustness-model-bank layout).
+# ------------------------------------------------------------------
+
+def load_bank_checkpoint(row, bank_repo_id=None):
+    """Load one bank checkpoint, either from the Hub or from local disk.
+
+    If `bank_repo_id` is given, `row['subfolder']` is loaded from that repo
+    (e.g. "gpt2Medium/FreeLaw/lambda_0"); transformers downloads once and
+    caches locally (~/.cache/huggingface/hub), so repeated calls across many
+    batches don't re-download. Otherwise falls back to `row['save_dir']`,
+    the local-path convention models_bank.py already produces -- this keeps
+    a locally-trained bank working unchanged.
+    """
+    if bank_repo_id is not None:
+        return AutoModelForCausalLM.from_pretrained(bank_repo_id, subfolder=row["subfolder"])
+    return AutoModelForCausalLM.from_pretrained(row["save_dir"])
+
+
+def filter_trained_rows(bank_df):
+    """Drop rows whose 'status' column marks them as not yet trained.
+
+    The Hub skeleton's metadata CSV pre-populates every (source, lambda)
+    slot with status="pending" before training, then flips it to "trained"
+    once a real checkpoint is pushed -- without this filter, a routing run
+    against that CSV would try to load checkpoints that don't exist yet.
+    Locally-trained metadata (models_bank.py's own output) has no 'status'
+    column at all -- every row it contains is already a real checkpoint --
+    so this is a no-op for that case.
+    """
+    if "status" not in bank_df.columns:
+        return bank_df
+    return bank_df[bank_df["status"] != "pending"].reset_index(drop=True)
+
+
+# ------------------------------------------------------------------
 # Steps 1-3: score every bank checkpoint, derive alpha_j(B) and lambda*_j(B)
 # ------------------------------------------------------------------
 
-def compute_bank_batch_losses(bank_df, batch, device):
+def compute_bank_batch_losses(bank_df, batch, device, bank_repo_id=None):
     """Compute L_hat_B(theta_{j,lambda}) for every checkpoint in the bank.
 
     This is the expensive step of Hierarchical Routing: it requires loading
@@ -67,7 +104,7 @@ def compute_bank_batch_losses(bank_df, batch, device):
     losses = []
 
     for _, row in bank_df.iterrows():
-        model = AutoModelForCausalLM.from_pretrained(row["save_dir"]).to(device)
+        model = load_bank_checkpoint(row, bank_repo_id).to(device)
         model.eval()
 
         with torch.no_grad():
@@ -99,13 +136,17 @@ def compute_source_relevance(scored_bank_df):
         best_idx = group["batch_loss"].idxmin()
         best_row = group.loc[best_idx]
 
-        rows.append({
+        # Keep every original column (save_dir for a local bank, subfolder
+        # for a Hub-hosted one) so downstream loading works either way,
+        # rather than hardcoding one location scheme here.
+        row = dict(best_row)
+        row.update({
             "dataset_name": dataset_name,
             "lambda_star": float(best_row["lambda"]),
             "best_loss": float(best_row["batch_loss"]),
             "alpha": -float(best_row["batch_loss"]),
-            "save_dir": best_row["save_dir"],
         })
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -126,11 +167,15 @@ def select_top_h_sources(source_relevance_df, H):
 # Step 4: candidate set C_B = {theta_0} U {theta_{j,lambda*_j} : j in J_B}
 # ------------------------------------------------------------------
 
-def build_candidate_state_dicts(top_sources_df, pretrained_model_name, device):
+def build_candidate_state_dicts(top_sources_df, pretrained_model_name, device, bank_repo_id=None):
     """Load theta_0 and the selected per-source checkpoints as plain state
     dicts. Kept as CPU tensors; only moved to `device` at interpolation time,
     since holding H+1 full gpt2-medium checkpoints on GPU simultaneously is
     unnecessary until they're actually combined.
+
+    theta_0 always comes from `pretrained_model_name` directly (e.g. plain
+    "gpt2-medium"), not from the bank repo's own theta_0/ subfolder -- those
+    are still empty placeholders as of this writing, no checkpoint pushed.
     """
     candidates = {}
 
@@ -139,7 +184,7 @@ def build_candidate_state_dicts(top_sources_df, pretrained_model_name, device):
     del theta_0
 
     for _, row in top_sources_df.iterrows():
-        model = AutoModelForCausalLM.from_pretrained(row["save_dir"])
+        model = load_bank_checkpoint(row, bank_repo_id)
         candidates[row["dataset_name"]] = {k: v.detach().clone() for k, v in model.state_dict().items()}
         del model
 
@@ -293,22 +338,28 @@ def compose_model(model_template, candidate_state_dicts, weights, device):
 # Top-level entry point
 # ------------------------------------------------------------------
 
-def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_name, device, config=None):
+def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_name, device, config=None, bank_repo_id=None):
     """Run Hierarchical Routing and return the deployed model theta_B plus a
     trail of the routing decision.
 
     `batch` is moved to `device` once here; every helper below assumes it
     already lives there.
+
+    bank_repo_id: if given (e.g. "alignment-decision-lab/robustness-model-bank"),
+    bank checkpoints are pulled from that Hub repo's subfolders instead of
+    from local `save_dir` paths -- see load_bank_checkpoint(). The metadata
+    CSV itself can still come from anywhere, local or downloaded.
     """
     config = {**DEFAULT_CONFIG, **(config or {})}
     batch = move_batch_to_device(batch, device)
 
     bank_df = load_model_bank_metadata(model_bank_metadata_path)
-    scored_bank_df = compute_bank_batch_losses(bank_df, batch, device)
+    bank_df = filter_trained_rows(bank_df)
+    scored_bank_df = compute_bank_batch_losses(bank_df, batch, device, bank_repo_id)
     source_relevance_df = compute_source_relevance(scored_bank_df)
     top_sources_df = select_top_h_sources(source_relevance_df, config["H"])
 
-    candidate_state_dicts = build_candidate_state_dicts(top_sources_df, pretrained_model_name, device)
+    candidate_state_dicts = build_candidate_state_dicts(top_sources_df, pretrained_model_name, device, bank_repo_id)
 
     model_template = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
     model_template.eval()
