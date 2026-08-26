@@ -121,6 +121,14 @@ between any two token distributions (see `shift_measurement.compute_kl` /
    validation of whether the cheap heuristic in step 3 is actually a good
    substitute for retraining.
 
+5. **`hierarchical_routing.py`** and **`routing_baselines.py`** — the three
+   deployment-time routing strategies from the paper's Section 4/5.1
+   (Hierarchical (ours), Hard, Flat soft), runnable against either a local
+   bank or the Hub-hosted `alignment-decision-lab/robustness-model-bank`.
+   See **[ROUTING_README.md](ROUTING_README.md)** for a full usage guide
+   (setup, HF auth gotchas, batch construction, config knobs, worked
+   examples).
+
 **Supporting/diagnostic files** (not in the main data-flow path, used to
 validate pieces of the above in isolation):
 - `shift_measurement.py` — shared metrics library (token-KL, embedding L2,
@@ -217,6 +225,9 @@ diagnostic_experiment/
 ├── erm_baselines.py                  # Thread B: per-deployment-domain ERM oracle models
 ├── algorithm_2.py                    # Thread B: the selection + interpolation decision procedure
 ├── algo2_real_test.py                # Thread B: end-to-end validation harness against oracle/brute-force baselines
+├── hierarchical_routing.py           # Thread B: Hierarchical (ours) routing strategy -- see ROUTING_README.md
+├── routing_baselines.py              # Thread B: Hard + Flat soft routing strategies -- see ROUTING_README.md
+├── ROUTING_README.md                 # usage guide for the three routing strategies above
 ├── shift_measurement.py              # shared shift-metric library + standalone metric-validation experiments
 ├── lambda_window.py                  # lambda-rho curve math, standalone projection script
 ├── lambda_calibration.py             # adjacent lambda-focused diagnostics
