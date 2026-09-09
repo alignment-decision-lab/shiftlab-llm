@@ -66,11 +66,16 @@ GRAM_PATH = os.path.join(ANALYSIS_DIR, "global_update_gram_matrix.csv")
 
 COORDINATES_PATH = os.path.join(ANALYSIS_DIR, "pca_coordinates.csv")
 
-FONT_SIZE_TITLE = 22
-FONT_SIZE_AXES = 18
-FONT_SIZE_TICKS = 14
-FONT_SIZE_LEGEND = 15
-FONT_SIZE_ANNOTATION = 12
+FONT_SIZE_TITLE = 24
+FONT_SIZE_AXES = 26
+FONT_SIZE_TICKS = 20
+FONT_SIZE_LEGEND = 21
+FONT_SIZE_ANNOTATION = 16
+
+# 2D figure style knobs
+CIRCLE_STYLE = "boundary"   # "boundary" (fill + outer/inner ring only), "all", or "none"
+SHOW_TITLE = False          # paper figures use the caption; set True for standalone use
+LABEL_LAMBDAS = "extremes"  # "extremes" (only smallest/largest lambda>0), "all", or "none"
 
 DATASET_COLORS = {
     "ArXiv": "#1f77b4",          # Matplotlib C0
@@ -168,7 +173,7 @@ def check_model_bank(entries):
         print(
             f"{dataset_name}: "
             f"{len(lambdas)} models "
-            f"-> {len(lambdas) - 1} robustness circles",
+            f"({len(lambdas) - 1} robustness checkpoints + ERM)",
             flush=True,
         )
 
@@ -551,66 +556,57 @@ def get_erm_coordinate(entries, model_coordinates, dataset_name):
 # 2D CIRCLES
 # ============================================================
 
-def add_2d_robustness_circles(ax, dataset_name, entries, model_coordinates, color):
-    """
-    Draw EXACTLY one circle for every robust model lambda > 0.
-
-    For each lambda:
-
-        center = PCA(theta_dataset, lambda=0)
-
-        radius =
-            ||PCA(theta_dataset, lambda)
-              - PCA(theta_dataset, lambda=0)||_2
-
-    Therefore the circle passes exactly through the
-    corresponding lambda model.
-
-    If a dataset contains N models including lambda=0,
-    this function draws exactly N - 1 circles.
-    """
-
+def _dataset_radii(dataset_name, entries, model_coordinates):
+    """Distances (in the PC1-PC2 plane) from the lambda=0 checkpoint to every
+    lambda>0 checkpoint of one dataset, paired with their lambda values and
+    sorted by lambda."""
     indices = get_dataset_indices(entries, dataset_name)
-    erm_coordinate = get_erm_coordinate(entries, model_coordinates, dataset_name)
+    erm = get_erm_coordinate(entries, model_coordinates, dataset_name)
 
-    center = (erm_coordinate[0], erm_coordinate[1])
-    circle_count = 0
-
+    out = []
     for i in indices:
         lambd = entries[i]["lambda"]
-
-        # lambda=0 is the CENTER, not a circle.
         if lambd == 0.0:
             continue
-        point = model_coordinates[i]
+        p = model_coordinates[i]
+        r = math.hypot(p[0] - erm[0], p[1] - erm[1])
+        out.append((lambd, r))
+    out.sort(key=lambda t: t[0])
+    return (erm[0], erm[1]), out
 
-        radius = math.sqrt((point[0] - erm_coordinate[0]) ** 2 + (point[1] - erm_coordinate[1]) ** 2)
-        circle = Circle(
-            center,
-            radius=radius,
-            fill=False,
-            edgecolor=color,
-            linestyle="--",
-            linewidth=2.0,
-            alpha=0.35,
-            zorder=1,
-        )
-        ax.add_patch(circle)
-        circle_count += 1
 
-    expected = (len(indices) - 1)
+def add_2d_robustness_circles(ax, dataset_name, entries, model_coordinates, color):
+    """Draw robustness contours around the lambda=0 checkpoint.
 
-    if circle_count != expected:
-        raise RuntimeError(
-            f"{dataset_name}: expected "
-            f"{expected} circles but drew "
-            f"{circle_count}."
-        )
-    print(
-        f"{dataset_name}: "
-        f"{circle_count} circles drawn in 2D.",
-        flush=True,
-    )
+    CIRCLE_STYLE controls the density:
+      - "none":     no circles (the connecting path alone shows the ordering)
+      - "boundary": a light fill out to the outermost lambda plus a dashed ring
+                    at the smallest and largest lambda>0 radius (2 rings)
+      - "all":      one dashed ring per lambda>0 (the old, cluttered behaviour)
+    """
+    if CIRCLE_STYLE == "none":
+        return
+
+    center, radii = _dataset_radii(dataset_name, entries, model_coordinates)
+    if not radii:
+        return
+
+    r_values = [r for _, r in radii]
+
+    if CIRCLE_STYLE == "all":
+        rings = r_values
+    else:  # "boundary"
+        rings = sorted({min(r_values), max(r_values)})
+        ax.add_patch(Circle(
+            center, radius=max(r_values),
+            facecolor=color, edgecolor="none", alpha=0.06, zorder=0,
+        ))
+
+    for r in rings:
+        ax.add_patch(Circle(
+            center, radius=r, fill=False, edgecolor=color,
+            linestyle="--", linewidth=1.6, alpha=0.35, zorder=1,
+        ))
 
 
 # ============================================================
@@ -654,12 +650,12 @@ def plot_pca_2d(pretrained_coordinates, model_coordinates, entries, explained_va
     for dataset_name in DATASET_LAMBDAS:
 
         color = DATASET_COLORS[dataset_name]
-        indices = get_dataset_indices(entries, dataset_name)
+        indices = get_dataset_indices(entries, dataset_name)   # sorted by lambda
         coords = model_coordinates[indices]
         lambdas = [entries[i]["lambda"] for i in indices]
 
         # ----------------------------------------------------
-        # CIRCLES FIRST
+        # ROBUSTNESS CONTOURS (light, behind everything)
         # ----------------------------------------------------
 
         add_2d_robustness_circles(
@@ -671,114 +667,100 @@ def plot_pca_2d(pretrained_coordinates, model_coordinates, entries, explained_va
         )
 
         # ----------------------------------------------------
-        # LAMBDA TRAJECTORY
+        # ROBUSTNESS PATH: connect the checkpoints in lambda order
         # ----------------------------------------------------
 
+        ax.plot(
+            coords[:, 0], coords[:, 1],
+            color=color, linewidth=2.0, alpha=0.8, zorder=4,
+            solid_capstyle="round",
+        )
         ax.scatter(
-            coords[:, 0],
-            coords[:, 1],
-            s=60,
-            color=color,
+            coords[:, 0], coords[:, 1],
+            s=70, color=color, zorder=5,
             label=DISPLAY_NAMES[dataset_name],
-            zorder=5,
         )
 
         # ----------------------------------------------------
-        # ERM lambda=0
+        # ERM lambda=0 (open marker at one end of the path)
         # ----------------------------------------------------
 
         erm_coordinate = get_erm_coordinate(entries, model_coordinates, dataset_name)
 
         ax.scatter(
-            erm_coordinate[0],
-            erm_coordinate[1],
-            s=190,
-            facecolor="white",
-            edgecolor=color,
-            linewidth=3.0,
-            zorder=8,
+            erm_coordinate[0], erm_coordinate[1],
+            s=240, facecolor="white", edgecolor=color, linewidth=3.0, zorder=8,
         )
-
         ax.annotate(
             r"$\lambda=0$",
-            (
-                erm_coordinate[0],
-                erm_coordinate[1],
-            ),
-            xytext=(8, -23),
-            textcoords="offset points",
-            fontsize=FONT_SIZE_ANNOTATION + 1,
-            fontweight="bold",
-            color=color,
+            (erm_coordinate[0], erm_coordinate[1]),
+            xytext=(8, -24), textcoords="offset points",
+            fontsize=FONT_SIZE_ANNOTATION, fontweight="bold", color=color,
         )
 
         # ----------------------------------------------------
-        # theta_0 -> dataset ERM
+        # theta_0 -> dataset ERM (dotted guide)
         # ----------------------------------------------------
 
         ax.plot(
             [pretrained_coordinates[0], erm_coordinate[0]],
             [pretrained_coordinates[1], erm_coordinate[1]],
-            linestyle=":",
-            color=color,
-            linewidth=1.4,
-            alpha=0.55,
-            zorder=2,
+            linestyle=":", color=color, linewidth=1.4, alpha=0.5, zorder=2,
         )
 
         # ----------------------------------------------------
-        # LAMBDA LABELS
+        # LAMBDA LABELS (only the extremes, to avoid clutter)
         # ----------------------------------------------------
 
-        for coord, lambd in zip(coords, lambdas):
-            if lambd == 0.0:
-                continue
-            ax.annotate(
-                rf"$\lambda={lambd:g}$",
-                (coord[0], coord[1]),
-                xytext=(7, 7),
-                textcoords="offset points",
-                fontsize=FONT_SIZE_ANNOTATION,
-                color=color,
-                zorder=9,
-            )
+        if LABEL_LAMBDAS != "none":
+            positive = [(c, l) for c, l in zip(coords, lambdas) if l != 0.0]
+            if LABEL_LAMBDAS == "extremes" and len(positive) > 2:
+                to_label = [positive[0], positive[-1]]
+            elif LABEL_LAMBDAS == "all":
+                to_label = positive
+            else:
+                to_label = positive
+            for coord, lambd in to_label:
+                ax.annotate(
+                    rf"$\lambda={lambd:g}$",
+                    (coord[0], coord[1]),
+                    xytext=(7, 7), textcoords="offset points",
+                    fontsize=FONT_SIZE_ANNOTATION - 2, color=color, zorder=9,
+                )
 
     # --------------------------------------------------------
     # FIGURE STYLE
     # --------------------------------------------------------
 
-    ax.set_xlabel(
-        f"PC1 "
-        f"({explained_var[0] * 100:.1f}% explained variance)",
-        fontsize=FONT_SIZE_AXES,
-    )
+    def _axis_label(k):
+        v = explained_var[k] if k < len(explained_var) else float("nan")
+        return f"PC{k+1}" if not (v == v) else f"PC{k+1} ({v * 100:.1f}% explained variance)"
 
-    ax.set_ylabel(
-        f"PC2 "
-        f"({explained_var[1] * 100:.1f}% explained variance)",
-        fontsize=FONT_SIZE_AXES,
-    )
+    ax.set_xlabel(_axis_label(0), fontsize=FONT_SIZE_AXES)
+    ax.set_ylabel(_axis_label(1), fontsize=FONT_SIZE_AXES)
 
-    ax.set_title(
-        "PCA of fine-tuned models across datasets "
-        "and robustness levels",
-        fontsize=FONT_SIZE_TITLE,
-        fontweight="bold",
-        pad=18,
-    )
+    if SHOW_TITLE:
+        ax.set_title(
+            "PCA of fine-tuned models across datasets and robustness levels",
+            fontsize=FONT_SIZE_TITLE, fontweight="bold", pad=18,
+        )
 
     ax.tick_params(axis="both", labelsize=FONT_SIZE_TICKS)
 
-    ax.grid(
-        True,
-        linestyle="--",
-        alpha=0.25,
+    ax.grid(True, linestyle="--", alpha=0.25)
+
+    # Legend outside the axes so it never covers the data.
+    ax.legend(
+        fontsize=FONT_SIZE_LEGEND,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+        markerscale=1.6,
+        handletextpad=0.5,
+        frameon=True,
     )
 
-    ax.legend(fontsize=FONT_SIZE_LEGEND, loc="best")
-
-    # Very important for true circles:
-    # same geometric scaling on PC1 and PC2.
+    # Same geometric scaling on PC1 and PC2 so circles read as circles.
     ax.set_aspect("equal", adjustable="datalim")
     plt.tight_layout()
     png_path = os.path.join(ANALYSIS_DIR, "PCA_2D.png")
@@ -790,6 +772,103 @@ def plot_pca_2d(pretrained_coordinates, model_coordinates, entries, explained_va
         f"{png_path}\n",
         flush=True,
     )
+
+
+# ============================================================
+# ROBUSTNESS-OFFSET FIGURE  (new: clean, projection-free)
+# ============================================================
+
+def compute_robustness_offsets(G, entries):
+    """For every dataset, the exact parameter-space distance
+    ||Delta_theta_{j,lambda} - Delta_theta_{j,0}||_2 between each robustness
+    checkpoint and that dataset's ERM (lambda=0) checkpoint, computed directly
+    from the Gram matrix G (no PCA / projection):
+
+        ||d_a - d_b||^2 = G[a,a] + G[b,b] - 2 G[a,b].
+
+    Returns a tidy DataFrame with columns: dataset, lambda, offset.
+    """
+    if hasattr(G, "detach"):
+        G = G.detach().cpu().numpy()
+    G = np.asarray(G, dtype=np.float64)
+    rows = []
+    for dataset_name in DATASET_LAMBDAS:
+        idx = get_dataset_indices(entries, dataset_name)          # sorted by lambda
+        erm = next(i for i in idx if entries[i]["lambda"] == 0.0)
+        for i in idx:
+            lam = entries[i]["lambda"]
+            d2 = G[i, i] + G[erm, erm] - 2.0 * G[i, erm]
+            rows.append({
+                "dataset": DISPLAY_NAMES.get(dataset_name, dataset_name),
+                "lambda": lam,
+                "offset": math.sqrt(max(d2, 0.0)),
+            })
+    df = pd.DataFrame(rows)
+    out_csv = os.path.join(ANALYSIS_DIR, "robustness_offsets.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"Robustness offsets saved to:\n{out_csv}", flush=True)
+    return df
+
+
+def plot_robustness_offset_vs_lambda(offsets_df):
+    """New figure: distance from each source's ERM checkpoint to its
+    lambda-checkpoints, versus lambda. One monotone curve per source -- shows
+    the robustness path directly, without the distortion of a 2D projection.
+
+    lambda=0 is ERM (offset 0 by construction) and is drawn as an open marker
+    on the left; the lambda>0 grid is on a log axis.
+    """
+    fig, ax = plt.subplots(figsize=(11, 8))
+
+    datasets = list(offsets_df["dataset"].unique())
+    palette = {
+        DISPLAY_NAMES.get(k, k): v for k, v in DATASET_COLORS.items()
+    }
+    cmap = plt.get_cmap("tab10")
+
+    # place lambda=0 one decade below the smallest positive lambda
+    pos = offsets_df.loc[offsets_df["lambda"] > 0, "lambda"]
+    erm_x = pos.min() / 3.0 if len(pos) else 1e-3
+
+    for k, name in enumerate(datasets):
+        sub = offsets_df[offsets_df["dataset"] == name].sort_values("lambda")
+        color = palette.get(name, cmap(k % 10))
+
+        p = sub[sub["lambda"] > 0]
+        ax.plot(p["lambda"], p["offset"], "-o", color=color, linewidth=2.4,
+                markersize=7, label=name, zorder=4)
+
+        # ERM point (open marker) + dotted connector to the smallest lambda
+        ax.scatter([erm_x], [0.0], s=110, facecolor="white",
+                   edgecolor=color, linewidth=2.2, zorder=5)
+        if len(p):
+            ax.plot([erm_x, p["lambda"].iloc[0]], [0.0, p["offset"].iloc[0]],
+                    ":", color=color, linewidth=1.4, alpha=0.6, zorder=3)
+
+    ax.set_xscale("log")
+    ax.axvline(erm_x, color="0.6", linewidth=1.0, linestyle="--", alpha=0.6)
+    ax.annotate(r"$\lambda=0$ (ERM)", (erm_x, ax.get_ylim()[1]),
+                xytext=(0, -18), textcoords="offset points",
+                ha="center", fontsize=FONT_SIZE_ANNOTATION, color="0.35")
+
+    ax.set_xlabel(r"robustness level $\lambda$  (log scale; smaller = more robust)",
+                  fontsize=FONT_SIZE_AXES)
+    ax.set_ylabel(r"$\|\theta_{j,\lambda}-\theta_{j,0}\|_2$"
+                  "\n(distance from the source's ERM checkpoint)",
+                  fontsize=FONT_SIZE_AXES)
+    if SHOW_TITLE:
+        ax.set_title("Robustness path length per source",
+                     fontsize=FONT_SIZE_TITLE, fontweight="bold", pad=14)
+    ax.tick_params(axis="both", labelsize=FONT_SIZE_TICKS)
+    ax.grid(True, which="both", linestyle="--", alpha=0.25)
+    ax.legend(fontsize=FONT_SIZE_LEGEND, loc="best", markerscale=1.3,
+              handletextpad=0.5)
+
+    plt.tight_layout()
+    png_path = os.path.join(ANALYSIS_DIR, "robustness_offset_vs_lambda.png")
+    plt.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nRobustness-offset figure saved to:\n{png_path}\n", flush=True)
 
 
 # ============================================================
@@ -1341,6 +1420,13 @@ def main():
     )
 
     # ========================================================
+    # 6b. ROBUSTNESS-OFFSET FIGURE (projection-free)
+    # ========================================================
+
+    offsets_df = compute_robustness_offsets(G, entries)
+    plot_robustness_offset_vs_lambda(offsets_df)
+
+    # ========================================================
     # 7. GLOBAL INTERACTIVE 3D FIGURE
     # ========================================================
 
@@ -1413,5 +1499,40 @@ def main():
     )
 
 
+def replot_from_csv(
+    coordinates_csv=COORDINATES_PATH,
+    offsets_csv=os.path.join(ANALYSIS_DIR, "robustness_offsets.csv"),
+    explained_var=(np.nan, np.nan, np.nan),
+):
+    """Redraw the 2D PCA figure and (if available) the robustness-offset
+    figure straight from the CSVs written by a previous full run -- lets you
+    iterate on the style knobs (fonts, CIRCLE_STYLE, ...) without reloading any
+    model weights or recomputing the Gram matrix.
+    """
+    df = pd.read_csv(coordinates_csv)
+
+    pre = df[df["model_type"] == "pretrained"].iloc[0]
+    pretrained_coordinates = np.array([pre["PC1"], pre["PC2"], pre["PC3"]])
+
+    ft = df[df["model_type"] != "pretrained"].copy()
+    # keep only datasets this script knows how to colour / grid
+    ft = ft[ft["dataset"].isin(DATASET_LAMBDAS)]
+    entries = [
+        {"dataset": r["dataset"], "lambda": float(r["lambda"])}
+        for _, r in ft.iterrows()
+    ]
+    model_coordinates = ft[["PC1", "PC2", "PC3"]].to_numpy()
+
+    plot_pca_2d(pretrained_coordinates, model_coordinates, entries,
+                np.asarray(explained_var, dtype=float))
+
+    if os.path.isfile(offsets_csv):
+        plot_robustness_offset_vs_lambda(pd.read_csv(offsets_csv))
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--replot":
+        replot_from_csv()
+    else:
+        main()

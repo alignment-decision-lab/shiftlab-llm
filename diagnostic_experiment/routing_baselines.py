@@ -45,48 +45,66 @@ def _bank_candidate_name(row):
     return f"{row['dataset_name']}_lambda_{row['lambda']:g}"
 
 
-def _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id=None):
-    """Batch loss for every bank checkpoint plus theta_0, using the same
-    naming convention as build_full_bank_candidates so the two line up."""
-    scored = compute_bank_batch_losses(bank_df, batch, device, bank_repo_id)
+def _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id=None, scored_bank_df=None, pretrained_loss=None):
+    if scored_bank_df is None:
+        scored_bank_df = compute_bank_batch_losses(bank_df, batch, device, bank_repo_id)
 
-    names = [_bank_candidate_name(row) for _, row in scored.iterrows()]
-    losses = scored["batch_loss"].tolist()
+    names = [_bank_candidate_name(row) for _, row in scored_bank_df.iterrows()]
+    losses = scored_bank_df["batch_loss"].tolist()
+
+    if pretrained_loss is None:
+        pretrained_loss = compute_pretrained_loss(pretrained_model_name, batch, device)
 
     names.append("theta_0")
-    losses.append(compute_pretrained_loss(pretrained_model_name, batch, device))
+    losses.append(pretrained_loss)
 
     return names, losses
 
 
-def build_full_bank_candidates(bank_df, pretrained_model_name, device, bank_repo_id=None):
-    """Load every checkpoint in the bank (every source x lambda pair) plus
-    theta_0, keyed by a unique candidate name.
-
-    Unlike hierarchical_routing.build_candidate_state_dicts (one candidate
-    per *selected* source, already reduced to its best lambda), this keeps
-    every individual (source, lambda) checkpoint as its own candidate, since
-    Hard/Flat routing consider the whole bank, not a source-reduced subset.
-    """
-    candidates = {}
+def compose_full_bank_streaming(bank_df, pretrained_model_name, names, weights, device, bank_repo_id=None):
+    """Compose the Flat routing model while loading only one bank checkpoint at a time."""
+    weight_dict = dict(zip(names, weights.tolist()))
 
     theta_0 = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
-    candidates["theta_0"] = {k: v.detach().clone() for k, v in theta_0.state_dict().items()}
+    mixed_state = {}
+
+    with torch.no_grad():
+        for name, tensor in theta_0.state_dict().items():
+            if torch.is_floating_point(tensor):
+                mixed_state[name] = tensor.detach().cpu().float() * weight_dict["theta_0"]
+            else:
+                mixed_state[name] = tensor.detach().cpu().clone()
+
     del theta_0
 
     for _, row in bank_df.iterrows():
+        candidate_name = _bank_candidate_name(row)
+        weight = weight_dict[candidate_name]
         model = load_bank_checkpoint(row, bank_repo_id)
-        candidates[_bank_candidate_name(row)] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+        with torch.no_grad():
+            for name, tensor in model.state_dict().items():
+                if torch.is_floating_point(tensor):
+                    mixed_state[name].add_(tensor.detach().cpu().float(), alpha=weight)
+
         del model
 
-    return candidates
+    model_template = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
+    model_template.load_state_dict(mixed_state)
+    model_template.eval()
+
+    del mixed_state
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return model_template
 
 
 # ------------------------------------------------------------------
 # Hard routing
 # ------------------------------------------------------------------
 
-def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, device, bank_repo_id=None):
+def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, device, bank_repo_id=None, bank_df=None, scored_bank_df=None, pretrained_loss=None):
     """theta_B = argmin_{theta in M} L_hat_B(theta), M = {theta_0} U bank.
 
     No interpolation -- the single best-scoring checkpoint is returned as is.
@@ -96,10 +114,12 @@ def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, dev
     hierarchical_routing.load_bank_checkpoint().
     """
     batch = move_batch_to_device(batch, device)
-    bank_df = load_model_bank_metadata(model_bank_metadata_path)
-    bank_df = filter_trained_rows(bank_df)
 
-    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id)
+    if bank_df is None:
+        bank_df = load_model_bank_metadata(model_bank_metadata_path)
+        bank_df = filter_trained_rows(bank_df)
+
+    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id, scored_bank_df=scored_bank_df, pretrained_loss=pretrained_loss)
     best_idx = min(range(len(losses)), key=lambda i: losses[i])
     best_name, best_loss = names[best_idx], losses[best_idx]
 
@@ -120,7 +140,7 @@ def run_hard_routing(model_bank_metadata_path, batch, pretrained_model_name, dev
 # Flat soft routing
 # ------------------------------------------------------------------
 
-def run_flat_routing(model_bank_metadata_path, batch, pretrained_model_name, device, tau=1.0, bank_repo_id=None):
+def run_flat_routing(model_bank_metadata_path, batch, pretrained_model_name, device, tau=1.0, bank_repo_id=None, bank_df=None, scored_bank_df=None, pretrained_loss=None):
     """w_k(B) = softmax(-s_k(B)/tau) over every k in M = {theta_0} U bank;
     theta_B = sum_k w_k(B) theta_k. Closed-form, no iterative optimization.
 
@@ -129,19 +149,23 @@ def run_flat_routing(model_bank_metadata_path, batch, pretrained_model_name, dev
     hierarchical_routing.load_bank_checkpoint().
     """
     batch = move_batch_to_device(batch, device)
-    bank_df = load_model_bank_metadata(model_bank_metadata_path)
-    bank_df = filter_trained_rows(bank_df)
 
-    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id)
+    if bank_df is None:
+        bank_df = load_model_bank_metadata(model_bank_metadata_path)
+        bank_df = filter_trained_rows(bank_df)
+
+    names, losses = _all_bank_losses(bank_df, pretrained_model_name, batch, device, bank_repo_id, scored_bank_df=scored_bank_df, pretrained_loss=pretrained_loss)
+
     weights = F.softmax(-torch.tensor(losses) / tau, dim=0)
 
-    candidates = build_full_bank_candidates(bank_df, pretrained_model_name, device, bank_repo_id)
-    ordered_candidates = {name: candidates[name] for name in names}  # keep order aligned with weights
-
-    model_template = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
-    model_template.eval()
-
-    theta_B = compose_model(model_template, ordered_candidates, weights.to(device), device)
+    theta_B = compose_full_bank_streaming(
+        bank_df=bank_df,
+        pretrained_model_name=pretrained_model_name,
+        names=names,
+        weights=weights,
+        device=device,
+        bank_repo_id=bank_repo_id,
+    )
 
     info = {
         "weights": dict(zip(names, weights.tolist())),

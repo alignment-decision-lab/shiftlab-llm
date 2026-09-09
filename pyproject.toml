@@ -1,8 +1,26 @@
 [project]
 name = "shiftlab"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = ["pyyaml"]
+
+[project.optional-dependencies]
+# The real GPU research pipeline (diagnostic_experiment/). Install with:
+#   uv sync --extra research
+research = [
+    "torch",
+    "transformers",
+    "datasets",
+    "huggingface_hub",
+    "accelerate",
+    "safetensors",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "plotly",
+]
 
 [build-system]
 requires = ["setuptools"]
@@ -10,3 +28,17 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# ---------------------------------------------------------------------------
+# uv project configuration
+# ---------------------------------------------------------------------------
+# torch is pulled from the CUDA 12.1 wheel index. Local box: NVIDIA T400 4GB,
+# driver 535.230.02, CUDA 12.2 -> cu121 wheels are compatible. For a CPU-only
+# machine, change the index url below to https://download.pytorch.org/whl/cpu
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
