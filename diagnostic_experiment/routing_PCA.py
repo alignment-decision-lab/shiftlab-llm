@@ -18,9 +18,16 @@ ANALYSIS_DIR = "outputs/routing_PCA"
 GRID_STEP = 0.05
 
 FONT_SIZE_AXES = 22
-FONT_SIZE_TICKS = 17
-FONT_SIZE_LEGEND = 18
-FONT_SIZE_ANNOTATION = 16
+FONT_SIZE_TICKS = 18
+FONT_SIZE_LEGEND = 19
+FONT_SIZE_ANNOTATION = 17
+
+EDGE_LINEWIDTH = 2.2
+TRAJECTORY_LINEWIDTH = 2.6
+BEST_TRAJECTORY_LINEWIDTH = 4.0
+LOSS_LINEWIDTH = 2.2
+BEST_LOSS_LINEWIDTH = 3.6
+REFERENCE_LINEWIDTH = 2.5
 
 
 # ============================================================
@@ -137,14 +144,14 @@ def get_trajectory_colors(trajectory_df):
     return {row["start_name"]: colors[i % len(colors)] for i, (_, row) in enumerate(starts.iterrows())}
 
 
-def set_pca_limits(ax, coordinate_dict, right_margin=0.22):
+def set_pca_limits(ax, coordinate_dict, right_margin=0.30, left_margin=0.16, bottom_margin=0.18, top_margin=0.18):
     coords = np.stack(list(coordinate_dict.values()), axis=0)
     x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
     y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
     dx, dy = max(x_max - x_min, 1.0), max(y_max - y_min, 1.0)
 
-    ax.set_xlim(x_min - 0.12 * dx, x_max + right_margin * dx)
-    ax.set_ylim(y_min - 0.15 * dy, y_max + 0.15 * dy)
+    ax.set_xlim(x_min - left_margin * dx, x_max + right_margin * dx)
+    ax.set_ylim(y_min - bottom_margin * dy, y_max + top_margin * dy)
 
 
 def plot_candidate_edges(ax, info, coordinate_dict, color="gray", alpha=0.35, linestyle="--"):
@@ -152,10 +159,14 @@ def plot_candidate_edges(ax, info, coordinate_dict, color="gray", alpha=0.35, li
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             c1, c2 = coordinate_dict[names[i]], coordinate_dict[names[j]]
-            ax.plot([c1[0], c2[0]], [c1[1], c2[1]], linestyle=linestyle, linewidth=1.2, alpha=alpha, color=color, zorder=1)
+            ax.plot([c1[0], c2[0]], [c1[1], c2[1]], linestyle=linestyle, linewidth=EDGE_LINEWIDTH, alpha=alpha, color=color, zorder=1)
 
 
 def plot_candidate_vertices(ax, info, coordinate_dict):
+    candidate_coords = np.stack([coordinate_dict[name] for name in info["candidate_names"]], axis=0)
+    x_min, x_max = candidate_coords[:, 0].min(), candidate_coords[:, 0].max()
+    x_span = max(x_max - x_min, 1.0)
+
     for name in info["candidate_names"]:
         coord = coordinate_dict[name]
 
@@ -163,13 +174,23 @@ def plot_candidate_vertices(ax, info, coordinate_dict):
             ax.scatter(coord[0], coord[1], marker="D", s=190, color="black", zorder=8)
             label = r"$\theta_0$"
         else:
-            ax.scatter(coord[0], coord[1], s=170, edgecolor="black", linewidth=0.8, zorder=8)
+            ax.scatter(coord[0], coord[1], s=170, edgecolor="black", linewidth=1.0, zorder=8)
             label = name
             if name in info.get("selected_lambdas", {}):
                 label = f"{name}, λ={info['selected_lambdas'][name]:g}"
 
-        ax.annotate(label, coord, xytext=(10, 10), textcoords="offset points", fontsize=FONT_SIZE_ANNOTATION, fontweight="bold", color="black",
-                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.72, pad=2.0), zorder=12)
+        # Keep annotations inside the plotting area, especially for the
+        # right-most vertex next to the heatmap colorbar.
+        if coord[0] >= x_max - 0.08 * x_span:
+            xytext, ha = (-12, 12), "right"
+        elif coord[0] <= x_min + 0.08 * x_span:
+            xytext, ha = (12, 12), "left"
+        else:
+            xytext, ha = (10, 10), "left"
+
+        ax.annotate(label, coord, xytext=xytext, textcoords="offset points", ha=ha, va="bottom",
+                    fontsize=FONT_SIZE_ANNOTATION, fontweight="bold", color="black",
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.78, pad=2.4), zorder=12)
 
 
 def plot_eg_trajectories(ax, info, trajectory_df, labels=True):
@@ -181,19 +202,19 @@ def plot_eg_trajectories(ax, info, trajectory_df, labels=True):
         start_name = group.iloc[0]["start_name"]
         color = color_map[start_name]
 
-        ax.plot(group["PC1"], group["PC2"], linewidth=3.0 if is_best else 1.5, alpha=1.0 if is_best else 0.45,
-                color=color, label=start_name if labels else None, zorder=6 if is_best else 4)
+        ax.plot(group["PC1"], group["PC2"], linewidth=BEST_TRAJECTORY_LINEWIDTH if is_best else TRAJECTORY_LINEWIDTH,
+                alpha=1.0 if is_best else 0.62, color=color, label=start_name if labels else None, zorder=6 if is_best else 4)
 
         start = group.iloc[0]
-        ax.scatter(start["PC1"], start["PC2"], marker="x", s=105 if is_best else 75, linewidth=2.2 if is_best else 1.5,
-                   color=color, alpha=1.0 if is_best else 0.65, zorder=7)
+        ax.scatter(start["PC1"], start["PC2"], marker="x", s=120 if is_best else 90,
+                   linewidth=2.8 if is_best else 2.0, color=color, alpha=1.0 if is_best else 0.78, zorder=7)
 
 
 def set_pca_axes(ax, explained_var):
     ax.set_xlabel(f"PC1 ({explained_var[0] * 100:.1f}% explained variance)", fontsize=FONT_SIZE_AXES)
     ax.set_ylabel(f"PC2 ({explained_var[1] * 100:.1f}% explained variance)", fontsize=FONT_SIZE_AXES)
     ax.tick_params(axis="both", labelsize=FONT_SIZE_TICKS)
-    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.grid(True, linestyle="--", linewidth=1.2, alpha=0.32)
 
 
 # ============================================================
@@ -202,7 +223,7 @@ def set_pca_axes(ax, explained_var):
 
 def plot_routing_pca_2d(info, coordinate_dict, trajectory_df, explained_var, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(15, 10.5))
 
     plot_candidate_edges(ax, info, coordinate_dict)
     plot_candidate_vertices(ax, info, coordinate_dict)
@@ -216,10 +237,10 @@ def plot_routing_pca_2d(info, coordinate_dict, trajectory_df, explained_var, out
     ax.annotate(text, selected, xytext=(12, -22), textcoords="offset points", fontsize=FONT_SIZE_ANNOTATION, fontweight="bold")
 
     set_pca_axes(ax, explained_var)
-    set_pca_limits(ax, coordinate_dict)
+    set_pca_limits(ax, coordinate_dict, right_margin=0.34)
     ax.legend(fontsize=FONT_SIZE_LEGEND, facecolor="white", framealpha=0.92, loc="upper right")
     ax.set_aspect("equal", adjustable="box")
-    plt.tight_layout()
+    fig.tight_layout(pad=1.5)
 
     path = os.path.join(output_dir, "hierarchical_PCA_trajectory_2D.png")
     plt.savefig(path, dpi=300, bbox_inches="tight", pad_inches=0.15)
@@ -235,7 +256,7 @@ def plot_routing_pca_2d(info, coordinate_dict, trajectory_df, explained_var, out
 
 def plot_loss_trajectory(info, trajectory_df, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(11.5, 7.0))
     color_map = get_trajectory_colors(trajectory_df)
 
     for start_id, group in trajectory_df.groupby("start_id"):
@@ -243,16 +264,16 @@ def plot_loss_trajectory(info, trajectory_df, output_dir):
         is_best = start_id == info["best_start_id"]
         name = group.iloc[0]["start_name"]
 
-        ax.plot(group["iteration"], group["loss"], linewidth=2.5 if is_best else 1.2, alpha=1.0 if is_best else 0.35,
-                color=color_map[name], label=name)
+        ax.plot(group["iteration"], group["loss"], linewidth=BEST_LOSS_LINEWIDTH if is_best else LOSS_LINEWIDTH,
+                alpha=1.0 if is_best else 0.62, color=color_map[name], label=name)
 
-    ax.axhline(info["batch_loss"], linestyle="--", linewidth=1.5, label="Selected routing loss")
+    ax.axhline(info["batch_loss"], linestyle="--", linewidth=REFERENCE_LINEWIDTH, label="Selected routing loss")
     ax.set_xlabel("EG iteration", fontsize=FONT_SIZE_AXES)
     ax.set_ylabel("Routing batch loss", fontsize=FONT_SIZE_AXES)
     ax.tick_params(axis="both", labelsize=FONT_SIZE_TICKS)
-    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.grid(True, linestyle="--", linewidth=1.2, alpha=0.32)
     ax.legend(fontsize=FONT_SIZE_LEGEND)
-    plt.tight_layout()
+    fig.tight_layout(pad=1.5)
 
     path = os.path.join(output_dir, "hierarchical_loss_trajectory.png")
     plt.savefig(path, dpi=300, bbox_inches="tight")
@@ -416,20 +437,20 @@ def plot_pca_loss_landscape(info, coordinate_dict, trajectory_df, grid_df, grid_
     losses = grid_pca_df["loss"].to_numpy()
     K = len(info["candidate_names"])
 
-    fig, ax = plt.subplots(figsize=(15, 10))
+    fig, ax = plt.subplots(figsize=(17, 11.5))
     cmap = make_light_colormap()
 
     # H=3: true triangular 2D simplex -> contour heatmap.
     if K == 3:
         triangulation = mtri.Triangulation(x, y)
         heatmap = ax.tricontourf(triangulation, losses, levels=30, cmap=cmap, alpha=0.55, zorder=0)
-        cbar = fig.colorbar(heatmap, ax=ax, pad=0.04)
+        cbar = fig.colorbar(heatmap, ax=ax, pad=0.055, fraction=0.046)
 
     # H=2: line simplex; H>3: higher-dimensional simplex projected into PCA.
     else:
         scatter = ax.scatter(x, y, c=losses, cmap=cmap, s=85 if K > 3 else 130, alpha=0.75,
                              edgecolor="none", zorder=2)
-        cbar = fig.colorbar(scatter, ax=ax, pad=0.04)
+        cbar = fig.colorbar(scatter, ax=ax, pad=0.055, fraction=0.046)
 
     cbar.set_label("Routing batch loss", fontsize=FONT_SIZE_AXES)
     cbar.ax.tick_params(labelsize=FONT_SIZE_TICKS)
@@ -440,7 +461,7 @@ def plot_pca_loss_landscape(info, coordinate_dict, trajectory_df, grid_df, grid_
     plot_optima(ax, info, coordinate_dict, trajectory_df, grid_summary)
 
     set_pca_axes(ax, explained_var)
-    set_pca_limits(ax, coordinate_dict, right_margin=0.25)
+    set_pca_limits(ax, coordinate_dict, right_margin=0.48, left_margin=0.18, bottom_margin=0.20, top_margin=0.20)
 
     ax.set_title(
         f"Routing loss landscape — Hierarchical optimum loss: {grid_summary['eg_best_loss']:.4f} | "
@@ -448,9 +469,9 @@ def plot_pca_loss_landscape(info, coordinate_dict, trajectory_df, grid_df, grid_
         fontsize=FONT_SIZE_AXES, pad=18
     )
 
-    ax.legend(fontsize=FONT_SIZE_LEGEND, facecolor="white", framealpha=0.95, loc="upper right")
+    ax.legend(fontsize=FONT_SIZE_LEGEND, facecolor="white", framealpha=0.95, loc="upper right", borderaxespad=0.8)
     ax.set_aspect("equal", adjustable="box")
-    plt.tight_layout()
+    fig.subplots_adjust(left=0.10, right=0.86, bottom=0.12, top=0.90)
 
     path = os.path.join(output_dir, "hierarchical_PCA_loss_landscape.png")
     plt.savefig(path, dpi=300, bbox_inches="tight", pad_inches=0.15)
