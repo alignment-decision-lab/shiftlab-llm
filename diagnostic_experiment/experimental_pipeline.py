@@ -397,7 +397,7 @@ EXPERIMENT_2_CONFIG = {
 
     "hierarchical": {
         "H": 3,
-        "num_iters": 5,
+        "num_iters": 20,
         "lr": 0.1,
         "num_random_starts": 5,
         "dirichlet_concentration": 1.0,
@@ -485,7 +485,7 @@ EXPERIMENT_3_CONFIG = {
     "batch_size": 16,
 
     "hierarchical": {
-        "H": 2,
+        "H": 3,
         "num_iters": 5,
         "lr": 0.1,
         "num_random_starts": 5,
@@ -545,9 +545,9 @@ EXPERIMENT_3_CONFIG = {
 
 # Only configurations listed here are executed, in this exact order.
 EXPERIMENTS = [
-    EXPERIMENT_1_CONFIG,
+    # EXPERIMENT_1_CONFIG,
     EXPERIMENT_2_CONFIG,
-    EXPERIMENT_3_CONFIG,
+    # EXPERIMENT_3_CONFIG,
 ]
 
 

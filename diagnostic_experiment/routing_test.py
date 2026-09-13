@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForLan
 import utils
 import hierarchical_routing as hr
 import routing_baselines as rb
-import PCA_routing as rpca
+import routing_PCA as rpca
 import episodic_tent as et
 import online_tent as ot
 from shiftlab.data.load_datasets import load_dataset_from_subconfig
