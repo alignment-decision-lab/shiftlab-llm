@@ -129,6 +129,144 @@ between any two token distributions (see `shift_measurement.compute_kl` /
    (setup, HF auth gotchas, batch construction, config knobs, worked
    examples).
 
+6. **`tent_baseline.py`, `episodic_tent.py`, `online_tent.py`,
+   `mixed_ft_gpt2_small.py`** — the remaining baselines compared against
+   routing in the paper's Table 2/3/4. All three Tent variants are a GPT-2
+   analog of TENT (Wang et al.): fine-tune only the LayerNorm affine
+   parameters by minimizing the causal-LM cross-entropy on the incoming
+   batch itself (not TENT's original prediction-entropy loss, since there's
+   no classifier head here). They differ in state handling:
+   `tent_baseline.py` splits one batch into an adaptation prefix and a
+   disjoint held-out evaluation suffix; `episodic_tent.py` adapts and
+   evaluates on the *same* full batch, then discards the adapted state
+   before the next batch (`B_t -> theta_t -> L_{B_t}(theta_t)`, reset every
+   time — this is "Episodic Tent" in the results); `online_tent.py` does
+   the same per-batch update but *keeps* the adapted LayerNorm parameters
+   and optimizer state across batches ("Online Tent" — carries state within
+   one deployment dataset in the Primary Episodic protocol, and across
+   domain switches entirely in the Non-stationary Stream protocol).
+   `mixed_ft_gpt2_small.py` trains the "Mixed-source FT" baseline: a single
+   GPT-2 Small fine-tuned on a uniform mixture of `EXPERIMENT_CONFIG["sources"]`,
+   which is what all three Tent variants adapt *on top of* (they reload from
+   this checkpoint, not from raw `theta_0`) — see `routing_test.py`'s
+   `run_mixed_ft`/`run_episodic_tent`/`init_online_tent`.
+
+7. **`experimental_pipeline.py`** and **`routing_test.py`** — the actual
+   orchestrator behind every number in the paper's results tables and
+   every CSV under `results/`. `experimental_pipeline.py` is deliberately
+   thin: it only defines `MODEL_REGISTRY`, `DATASET_REGISTRY`, and a list of
+   per-experiment `EXPERIMENT_CONFIG` dicts (model size, source domains,
+   deployment domains, routing/Tent hyperparameters, which protocols to
+   run), then loops over them calling `routing_test.run_experiment(...)`
+   — "this file deliberately contains no routing/adaptation implementation"
+   per its own header comment. All the scientific logic lives in
+   `routing_test.py`, which implements both deployment protocols from the
+   paper's §5.2:
+   - `run_primary_episodic` — the per-dataset stream (`results/episodic/`):
+     for each deployment dataset, run every method (Pretrained, Best Single
+     FT, Mixed FT, both Tent variants, Hard/Flat/Static-Hierarchical/
+     Hierarchical Routing, the target-FT Oracle) batch by batch, with
+     `compute_shared_routing_scores` scoring the bank once per batch and
+     reusing it across all routing methods to keep the cost accounting fair.
+   - `run_nonstationary_stream` — the pooled, interleaved-conditions stream
+     (`results/nonstationary_stream/`), same methods, `build_balanced_stream`
+     controls how conditions interleave.
+   - `save_primary_paper_tables` / `save_nonstationary_table` /
+     `save_method_comparison_table` — write the CSVs that back Tables 2–4 in
+     the paper directly; `oracle_gap_closed` here is the exact function
+     behind the paper's normalized gap-closed metric.
+
+8. **`robustness_efficiency.py`** — generates the paper's Table 1 (the
+   robustness/homoglyph-corruption table) end to end: evaluates every
+   trained (source, λ) checkpoint from the bank against a held-out ArXiv
+   set and several corrupted/shifted variants of it, builds the loss and
+   perplexity tables (`build_loss_table`, `build_ppl_table`), picks the
+   best λ per corruption severity (`build_best_lambda_summary`), and emits
+   both the colored figure and the LaTeX table (`plot_colored_loss_table`,
+   `save_latex_loss_table`) used directly in the paper.
+
+9. **`routing_PCA.py`** (with **`PCA.py`**) — generates the EG-optimization
+   diagnostic plots referenced throughout the paper's §5.6 (the loss
+   trajectory and PCA loss-landscape figures for a single routed batch,
+   e.g. `results/episodic/target-pg19/hierarchical_*.png`): projects the
+   candidate checkpoints and every multi-start EG trajectory into a shared
+   PCA basis (`compute_candidate_pca`, `plot_eg_trajectories`), and
+   separately runs a brute-force simplex grid search
+   (`run_simplex_grid_search`) to plot the true loss landscape
+   (`plot_pca_loss_landscape`) and check the EG optimum against it — this
+   is the grid-search-vs-EG comparison used to argue the optimizer itself
+   isn't the bottleneck. `PCA.py` (`run_routing_pca`'s dependency,
+   `augment_gram_with_pretrained`) is the more general, standalone version
+   of the same PCA machinery behind the paper's Figure 4/9 robustness-path
+   plots: it downloads the full bank from the Hub, computes one global Gram
+   matrix of parameter updates across *all* sources and λ (not just one
+   batch's routing candidates), and produces the 2D/3D robustness-path
+   figures.
+
+10. **`eg_extrapolation.py`** *(branch `eg-cone-extrapolation`, not yet on
+   `main` — check you're on that branch before looking for this file)* — a
+   proposed, not-yet-validated extension of Hierarchical Routing (paper
+   Appendix C.1), kept in its own file specifically so it never has to
+   modify `hierarchical_routing.py`, the file every reported result depends
+   on. Standard Hierarchical Routing optimizes over the simplex Δ(C_B)
+   spanned by the selected candidates; this instead optimizes over the
+   *tangent cone* of that simplex at one distinguished candidate θ̄
+   (`select_anchor`: `"pretrained"` = θ_0, `"worst"` = the candidate with
+   the largest batch loss, or `"all"` = try every candidate and keep the
+   best, at K× the cost). The facet opposite θ̄ is relaxed — θ̄'s weight may
+   go negative (extrapolate past it) — while every other candidate stays
+   non-negative as usual. Mechanically this needs no new machinery, only
+   *removing* plain EG's final renormalization for the non-anchor
+   coordinates (`cone_gradient_step`); the anchor's coordinate is then
+   recovered as `1 - sum(others)`. Because the cone is unbounded, there is
+   no finite vertex set to fall back on the way Algorithm 1 falls back on
+   its H+1 simplex vertices — the "no worse than plain Hierarchical
+   Routing" guarantee is instead enforced explicitly, by running
+   `hierarchical_routing.multi_start_optimize` itself as a mandatory
+   fallback candidate inside `multi_start_optimize_cone` and keeping
+   whichever result is better. `run_cone_routing(...)` mirrors
+   `run_hierarchical_routing`'s signature and `(theta_B, info)` return
+   shape exactly, so it is a drop-in alternative at the same call sites.
+
+   **Known fragility, found and fixed twice so far**: (1) the un-normalized
+   update has no self-correcting projection step, so a poorly-scaled `lr`
+   could overshoot catastrophically in a single step and drive a
+   non-anchor weight to *exactly* floating-point `0.0` — an absorbing
+   state a multiplicative update can never escape, silently and
+   permanently trapping the search at the wrong vertex with no error
+   raised. `cone_gradient_step`'s `max_log_step` clips the per-step
+   exponent to guard against this. (2) Even without that catastrophe, a
+   *fixed* `cone_lr` is not safe in general: the same nominal value
+   converges in a couple of iterations for a nearby off-simplex optimum
+   but oscillates for hundreds of iterations without converging for a
+   farther one or a smaller candidate set — the right step size depends
+   on the local gradient magnitude, not on `lr`, distance, or `K` alone
+   (see `test_cone_convergence_study.py`). `optimize_weights_cone` now
+   defaults to backtracking line search (`adaptive=True`) with an Armijo
+   sufficient-decrease condition — plain "did the loss go down at all"
+   backtracking turned out *not* to be enough, since a slowly-damping
+   oscillation still satisfies that at every single step; only rejecting
+   steps that under-deliver relative to their linearized prediction
+   actually kills the oscillation. With this, the same starting `cone_lr`
+   converges in single digits to ~20 iterations across every distance/`K`
+   combination tested so far, with no per-scenario tuning. `MAX_LOG_STEP`
+   and the line-search constants (`shrink_factor`, `grow_factor`,
+   `max_backtracks`, `armijo_c`) are still fixed constants validated only
+   against the scales exercised in the test suite, not proven safe in
+   general — the difference is that a badly-scaled starting `cone_lr` is
+   now self-correcting within a run instead of needing to be hand-found
+   per scenario beforehand.
+
+   No real bank or deployment data has been run through this module yet —
+   every test uses random tiny GPT-2 checkpoints or a hand-constructed
+   analytic loss with a known ground-truth optimum, specifically to
+   validate the *mechanics* (does it find a known-to-exist off-simplex
+   optimum; does it correctly discover which of several facets to relax;
+   does it correctly fall back when there is nothing to find) rather than
+   whether it actually helps on the real routing task. See
+   `test_eg_extrapolation_synthetic.py` and the paper's Appendix C "Scope"
+   paragraph for exactly what is and isn't established so far.
+
 **Supporting/diagnostic files** (not in the main data-flow path, used to
 validate pieces of the above in isolation):
 - `shift_measurement.py` — shared metrics library (token-KL, embedding L2,
@@ -227,12 +365,22 @@ diagnostic_experiment/
 ├── algo2_real_test.py                # Thread B: end-to-end validation harness against oracle/brute-force baselines
 ├── hierarchical_routing.py           # Thread B: Hierarchical (ours) routing strategy -- see ROUTING_README.md
 ├── routing_baselines.py              # Thread B: Hard + Flat soft routing strategies -- see ROUTING_README.md
-├── ROUTING_README.md                 # usage guide for the three routing strategies above
+├── tent_baseline.py                  # Thread B: held-out/canary Tent baseline (adapt-prefix/eval-suffix split)
+├── episodic_tent.py                  # Thread B: "Episodic Tent" -- resets adapted state every batch
+├── online_tent.py                    # Thread B: "Online Tent" -- carries adapted state across batches
+├── mixed_ft_gpt2_small.py            # Thread B: trains the "Mixed-source FT" baseline Tent adapts on top of
+├── experimental_pipeline.py          # Thread B: thin orchestrator -- MODEL/DATASET_REGISTRY + EXPERIMENT_CONFIGs -> routing_test.run_experiment
+├── routing_test.py                   # Thread B: all scientific logic -- both deployment protocols, every results/*.csv comes from here
+├── robustness_efficiency.py          # Thread B: generates the paper's Table 1 (robustness/homoglyph-corruption table + figure)
+├── routing_PCA.py                    # Thread B: EG trajectory + loss-landscape diagnostic plots (paper Section 5.6)
+├── eg_extrapolation.py               # Thread B: proposed tangent-cone extension (paper App. C.1) -- branch eg-cone-extrapolation, NOT validated on real data
+├── ROUTING_README.md                 # usage guide for the four routing strategies above
 ├── shift_measurement.py              # shared shift-metric library + standalone metric-validation experiments
 ├── lambda_window.py                  # lambda-rho curve math, standalone projection script
 ├── lambda_calibration.py             # adjacent lambda-focused diagnostics
 ├── lambda_analysis_utils.py          # adjacent lambda-focused diagnostics
 ├── lambda_model_analysis.py          # adjacent lambda-focused diagnostics
 ├── interpolation_utils.py            # weight interpolation implementation
-└── robustness_path.py                # geometric validation of interpolation vs. directly-trained intermediate-lambda models
+├── robustness_path.py                # geometric validation of interpolation vs. directly-trained intermediate-lambda models
+└── PCA.py                            # standalone robustness-path PCA (paper Figure 4/9), Hub-based bank download + global Gram matrix
 ```

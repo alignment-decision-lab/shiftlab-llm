@@ -99,9 +99,20 @@ def test_end_to_end_on_synthetic_bank():
     try:
         pretrained_dir, bank_metadata_path = make_synthetic_bank(tmp_dir)
         batch = make_synthetic_batch(vocab_size=TINY_CONFIG.vocab_size)
+        bank_df = hr.filter_trained_rows(hr.load_model_bank_metadata(bank_metadata_path))
+        scored_bank_df = hr.compute_bank_batch_losses(bank_df, batch, device)
+        pretrained_loss = rb.compute_pretrained_loss(
+            pretrained_model_name=pretrained_dir, batch=batch, device=device,
+        )
 
+        # H=3: theta_0 now competes for a slot against the 2 source
+        # representatives (select_routing_candidates), rather than always
+        # getting a free slot -- with only 3 representatives total, H=3
+        # guarantees all of them survive regardless of who wins, keeping
+        # this test deterministic despite theta_0/sources being random
+        # synthetic checkpoints.
         config = {
-            "H": 2,
+            "H": 3,
             "num_iters": 5,          # tiny, just enough to exercise the loop
             "lr": 0.1,
             "num_random_starts": 2,
@@ -113,11 +124,14 @@ def test_end_to_end_on_synthetic_bank():
             pretrained_model_name=pretrained_dir,
             device=device,
             config=config,
+            bank_df=bank_df,
+            scored_bank_df=scored_bank_df,
+            pretrained_loss=pretrained_loss,
         )
 
         weight_sum = sum(info["weights"].values())
         assert abs(weight_sum - 1.0) < 1e-4, f"routing weights should sum to 1, got {weight_sum}"
-        assert len(info["selected_sources"]) == 2, "H=2 should keep exactly 2 sources"
+        assert len(info["selected_sources"]) == 2, "H=3 with 2 sources + theta_0 should keep both sources"
         assert info["batch_loss"] < float("inf")
 
         # theta_B should be a real usable model.
@@ -177,6 +191,11 @@ def test_flat_routing_on_synthetic_bank():
     try:
         pretrained_dir, bank_metadata_path = make_synthetic_bank(tmp_dir)
         batch = make_synthetic_batch(vocab_size=TINY_CONFIG.vocab_size)
+        bank_df = hr.filter_trained_rows(hr.load_model_bank_metadata(bank_metadata_path))
+        scored_bank_df = hr.compute_bank_batch_losses(bank_df, batch, device)
+        pretrained_loss = rb.compute_pretrained_loss(
+            pretrained_model_name=pretrained_dir, batch=batch, device=device,
+        )
 
         theta_B, info = rb.run_flat_routing(
             model_bank_metadata_path=bank_metadata_path,
@@ -184,9 +203,17 @@ def test_flat_routing_on_synthetic_bank():
             pretrained_model_name=pretrained_dir,
             device=device,
             tau=1.0,
+            H=3,  # 2 sources + theta_0 = 3 representatives total; H=3 keeps all of them
+            bank_df=bank_df,
+            scored_bank_df=scored_bank_df,
+            pretrained_loss=pretrained_loss,
         )
 
-        assert len(info["weights"]) == 7
+        # Flat Routing is now Top-H screened (over source representatives,
+        # not the full lambda grid): 2 sources + theta_0 = 3 candidates,
+        # not 7 (2 sources x 3 lambdas + theta_0) as in the old full-bank
+        # version.
+        assert len(info["weights"]) == 3
         weight_sum = sum(info["weights"].values())
         assert abs(weight_sum - 1.0) < 1e-4, f"flat routing weights should sum to 1, got {weight_sum}"
         assert all(w >= 0 for w in info["weights"].values())
