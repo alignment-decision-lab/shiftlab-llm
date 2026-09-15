@@ -16,7 +16,6 @@ import utils
 import hierarchical_routing as hr
 import routing_baselines as rb
 import routing_PCA as rpca
-import episodic_tent as et
 import online_tent as ot
 from shiftlab.data.load_datasets import load_dataset_from_subconfig
 
@@ -25,23 +24,24 @@ BANK_REPO_ID = "alignment-decision-lab/robustness-model-bank"
 OUTPUT_ROOT = "outputs/experimental_pipeline"
 
 PRIMARY_METHODS = [
-    "pretrained", "best_single_ft", "mixed_ft", "episodic_tent", "online_tent",
-    "hard", "flat", "static_hierarchical", "hierarchical", "oracle",
+    "pretrained", "best_single_ft", "mixed_ft", "static_tent_best_single", "tent_best_single",
+    "hard", "flat", "static_hierarchical", "hierarchical", "tent_hierarchical", "oracle",
 ]
 NONSTATIONARY_METHODS = [
-    "pretrained", "best_single_ft", "mixed_ft", "episodic_tent", "online_tent",
-    "hard", "flat", "static_hierarchical", "hierarchical",
+    "pretrained", "best_single_ft", "mixed_ft", "static_tent_best_single", "tent_best_single",
+    "hard", "flat", "static_hierarchical", "hierarchical", "tent_hierarchical",
 ]
 METHOD_LABELS = {
     "pretrained": "Pretrained",
     "best_single_ft": "Best Single FT",
     "mixed_ft": "Mixed-source FT",
-    "episodic_tent": "Episodic Tent",
-    "online_tent": "Online Tent",
+    "static_tent_best_single": "Static TENT (Best Single-FT)",
+    "tent_best_single": "TENT (Best Single-FT)",
     "hard": "Hard Routing",
     "flat": "Flat Routing",
     "static_hierarchical": "Static Hierarchical Routing",
     "hierarchical": "Hierarchical Routing",
+    "tent_hierarchical": "TENT (Hierarchical Routing)",
     "oracle": "Target-FT Oracle",
 }
 
@@ -65,6 +65,13 @@ def get_bank_prefix(EXPERIMENT_CONFIG, MODEL_REGISTRY):
     return get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)["bank_prefix"]
 
 
+def get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=False):
+    cfg = dict(EXPERIMENT_CONFIG["hierarchical"])
+    if for_tent:
+        cfg["num_iters"] = EXPERIMENT_CONFIG.get("tent_hierarchical", {}).get("num_iters", cfg["num_iters"])
+    return cfg
+
+
 def get_mixed_ft_config(EXPERIMENT_CONFIG):
     return EXPERIMENT_CONFIG.get("mixed_ft")
 
@@ -79,7 +86,7 @@ def mixed_ft_source_name(source):
 
 
 def validate_mixed_ft_config(EXPERIMENT_CONFIG, MODEL_REGISTRY):
-    mixed_ft_methods = {"mixed_ft", "episodic_tent", "online_tent"}
+    mixed_ft_methods = {"mixed_ft"}
 
     mixed_ft_required = False
     for protocol in ["primary_episodic", "nonstationary_stream"]:
@@ -97,8 +104,7 @@ def validate_mixed_ft_config(EXPERIMENT_CONFIG, MODEL_REGISTRY):
     mixed_ft = get_mixed_ft_config(EXPERIMENT_CONFIG)
     if mixed_ft is None:
         raise ValueError(
-            "This experiment uses Mixed FT / Tent, but no 'mixed_ft' "
-            "configuration was provided in EXPERIMENT_CONFIG."
+            "This experiment uses Mixed-source FT, but no 'mixed_ft' configuration was provided in EXPERIMENT_CONFIG."
         )
 
     subfolder = mixed_ft.get("subfolder")
@@ -177,11 +183,7 @@ def save_status(output_dir, status, protocol=None, dataset=None, batch=None, err
 def get_protocol_methods(EXPERIMENT_CONFIG, protocol):
     cfg = EXPERIMENT_CONFIG[protocol]
     default = PRIMARY_METHODS if protocol == "primary_episodic" else NONSTATIONARY_METHODS
-    methods = list(cfg.get("methods", default))
-    # Backward compatibility with the old single "tent" name.
-    if "tent" in methods:
-        methods = [m for m in methods if m != "tent"] + ["episodic_tent", "online_tent"]
-    return methods
+    return list(cfg.get("methods", default))
 
 
 def validate_config(EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
@@ -199,6 +201,9 @@ def validate_config(EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
     hier = EXPERIMENT_CONFIG.get("hierarchical", {})
     if hier.get("H", 0) <= 0 or hier.get("num_iters", 0) <= 0:
         raise ValueError("hierarchical.H and hierarchical.num_iters must be > 0.")
+    tent_hier = EXPERIMENT_CONFIG.get("tent_hierarchical", {})
+    if "num_iters" in tent_hier and tent_hier["num_iters"] <= 0:
+        raise ValueError("tent_hierarchical.num_iters must be > 0.")
     tent = EXPERIMENT_CONFIG.get("tent", {})
     if tent.get("num_steps", 0) <= 0 or tent.get("lr", 0) <= 0:
         raise ValueError("tent.num_steps and tent.lr must be > 0.")
@@ -367,6 +372,21 @@ def oracle_gap_closed(loss_method, loss_pretrained, loss_oracle):
     return (float(loss_pretrained) - float(loss_method)) * 100.0 / denominator
 
 
+def relative_loss_improvement(loss_method, loss_pretrained):
+    """Percentage loss reduction relative to Pretrained on the same batch."""
+    values = [loss_method, loss_pretrained]
+    if any(v is None or pd.isna(v) for v in values) or abs(float(loss_pretrained)) < 1e-12:
+        return float("nan")
+    return (float(loss_pretrained) - float(loss_method)) * 100.0 / float(loss_pretrained)
+
+
+def add_relative_loss_improvement(method_results):
+    pre = next((r for r in method_results if r["method"] == "Pretrained"), None)
+    pre_loss = pre.get("loss") if pre else None
+    for result in method_results:
+        result["relative_loss_improvement_pct"] = relative_loss_improvement(result.get("loss"), pre_loss)
+
+
 def num_batch_tokens(batch):
     if "attention_mask" in batch:
         return int(batch["attention_mask"].sum().item())
@@ -435,75 +455,52 @@ def run_mixed_ft(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
 
 
 # ============================================================
-# TENT BASELINES: SAME BATCH FOR ADAPTATION AND EVALUATION
+# TENT METHODS: SAME BATCH FOR ADAPTATION AND EVALUATION
 # ============================================================
-# The actual adaptation mechanisms live in two dedicated modules:
-#   * episodic_tent.py: reload Mixed FT before every incoming batch.
-#   * online_tent.py: initialize Mixed FT once and retain adapted LayerNorm
-#                     parameters + optimizer state across subsequent batches.
-#
-# Both modules use the full incoming batch B for adaptation and evaluation.
-# There is intentionally no adapt_fraction and no disjoint hold-out suffix.
-# These small wrappers only translate their outputs into the common result
-# format expected by the two experimental protocols below.
+# online_tent.py only implements the adaptation mechanism. This runner chooses
+# the initialization model and accounts for its deployment cost. Best Single-FT
+# is selected once on B1; Hierarchical Routing is also solved once on B1 for
+# TENT (Hierarchical Routing). Both TENT variants then carry their adapted
+# LayerNorm parameters and optimizer state through subsequent batches.
+# Static TENT performs the same Best Single-FT -> TENT operation on B1, then
+# freezes the resulting model for B2...BT.
 
 
-def run_episodic_tent(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
-    subfolder = get_mixed_ft_subfolder(EXPERIMENT_CONFIG)
-    if subfolder is None:
-        return {"method": "Episodic Tent", "loss": float("nan"), "perplexity": float("nan"), "total_time_sec": float("nan"), "num_tokens": None, "status": "mixed_ft_not_configured"}
-
+def init_tent_from_best_single(selected_model, selection_time, device, EXPERIMENT_CONFIG):
     start = time.time()
-    model, info = et.run_episodic_tent(
-        base_model_name_or_path=subfolder, batch=batch, device=device,
-        config=EXPERIMENT_CONFIG["tent"], bank_repo_id=BANK_REPO_ID,
-    )
-    total_time = time.time() - start
-    num_tokens = num_batch_tokens(batch)
-    clear_model(model, device)
+    model = load_hub_model(selected_model["subfolder"], device)
+    state = ot.initialize_online_tent(model=model, device=device, config=EXPERIMENT_CONFIG["tent"])
+    return state, selection_time + (time.time() - start)
 
+
+def init_tent_from_model(model, initialization_time, device, EXPERIMENT_CONFIG):
+    start = time.time()
+    state = ot.initialize_online_tent(model=model, device=device, config=EXPERIMENT_CONFIG["tent"])
+    return state, initialization_time + (time.time() - start)
+
+
+def run_tent_batch(state, batch, batch_id, initialization_time, device, method_name):
+    if state is None:
+        raise RuntimeError(f"{method_name} state was not initialized on batch 1.")
+    start = time.time()
+    state, info = ot.run_online_tent_batch(state, batch, device)
+    total_time = (time.time() - start) + (initialization_time if batch_id == 0 else 0.0)
     return {
-        "method": "Episodic Tent", "loss": float(info["loss_after"]),
-        "perplexity": loss_to_perplexity(info["loss_after"]), "total_time_sec": total_time,
-        "num_tokens": num_tokens, "loss_before": float(info["loss_before"]),
+        "method": method_name, "loss": float(info["loss_after"]), "perplexity": loss_to_perplexity(info["loss_after"]),
+        "total_time_sec": total_time, "num_tokens": num_batch_tokens(batch), "loss_before": float(info["loss_before"]),
         "loss_after": float(info["loss_after"]), "loss_improvement": float(info["loss_improvement"]),
-        "num_trainable_params": int(info["num_trainable_params"]),
-        "num_adaptation_steps": int(info["num_adaptation_steps"]),
-        "adaptation_lr": float(info["adaptation_lr"]), "state_carried": False,
+        "num_trainable_params": int(info["num_trainable_params"]), "num_adaptation_steps": int(info["num_adaptation_steps"]),
+        "adaptation_lr": float(info["adaptation_lr"]), "state_carried": batch_id > 0,
+        "num_batches_seen": int(info["num_batches_seen"]),
     }
 
 
-def init_online_tent(device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
-    subfolder = get_mixed_ft_subfolder(EXPERIMENT_CONFIG)
-    if subfolder is None:
-        return None, 0.0
-
+def evaluate_static_tent(model, batch, device):
     start = time.time()
-    state = ot.initialize_online_tent(
-        base_model_name_or_path=subfolder, device=device,
-        config=EXPERIMENT_CONFIG["tent"], bank_repo_id=BANK_REPO_ID,
-    )
-    return state, time.time() - start
-
-
-def run_online_tent_batch(state, batch, batch_id, init_time, device):
-    if state is None:
-        return {"method": "Online Tent", "loss": float("nan"), "perplexity": float("nan"), "total_time_sec": float("nan"), "num_tokens": None, "status": "mixed_ft_not_configured"}
-
-    start = time.time()
-    state, info = ot.run_online_tent_batch(state, batch, device)
-    total_time = (time.time() - start) + (init_time if batch_id == 0 else 0.0)
-    num_tokens = num_batch_tokens(batch)
-
+    loss, _, _, num_tokens = evaluate_batch(model, batch, device)
     return {
-        "method": "Online Tent", "loss": float(info["loss_after"]),
-        "perplexity": loss_to_perplexity(info["loss_after"]), "total_time_sec": total_time,
-        "num_tokens": num_tokens, "loss_before": float(info["loss_before"]),
-        "loss_after": float(info["loss_after"]), "loss_improvement": float(info["loss_improvement"]),
-        "num_trainable_params": int(info["num_trainable_params"]),
-        "num_adaptation_steps": int(info["num_adaptation_steps"]),
-        "adaptation_lr": float(info["adaptation_lr"]),
-        "state_carried": batch_id > 0, "num_batches_seen": int(info["num_batches_seen"]),
+        "method": "Static TENT (Best Single-FT)", "loss": float(loss), "perplexity": loss_to_perplexity(loss),
+        "total_time_sec": time.time() - start, "num_tokens": num_tokens, "state_carried": False, "adaptation_recomputed": False,
     }
 
 
@@ -590,13 +587,13 @@ def run_flat(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_sco
     return result, info
 
 
-def build_hierarchical_model(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, method_name="Hierarchical Routing"):
+def build_hierarchical_model(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config, method_name="Hierarchical Routing"):
     """Build a hierarchical composition and keep the returned model alive for optional static reuse."""
     start = time.time()
     cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
     model, info = hr.run_hierarchical_routing(
         model_bank_metadata_path=metadata_path, batch=batch, pretrained_model_name=cfg["model_name"],
-        pretrained_subfolder=cfg.get("pretrained_subfolder"), device=device, config=EXPERIMENT_CONFIG["hierarchical"],
+        pretrained_subfolder=cfg.get("pretrained_subfolder"), device=device, config=hierarchical_config,
         bank_repo_id=BANK_REPO_ID, bank_df=bank_df, scored_bank_df=scored_bank_df, pretrained_loss=pretrained_loss,
     )
     method_time = time.time() - start
@@ -679,6 +676,7 @@ def build_base_row(EXPERIMENT_CONFIG, MODEL_REGISTRY, protocol, dataset, batch_i
         "deployment_offset_tokens": offset_tokens, "num_sources": len(EXPERIMENT_CONFIG["sources"]),
         "sources": str(EXPERIMENT_CONFIG["sources"]), "H": EXPERIMENT_CONFIG["hierarchical"]["H"],
         "hierarchical_num_iters": EXPERIMENT_CONFIG["hierarchical"]["num_iters"],
+        "tent_hierarchical_num_iters": get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=True)["num_iters"],
         "hierarchical_lr": EXPERIMENT_CONFIG["hierarchical"]["lr"], "flat_tau": EXPERIMENT_CONFIG["flat"]["tau"],
         "tent_lr": EXPERIMENT_CONFIG["tent"]["lr"], "tent_num_steps": EXPERIMENT_CONFIG["tent"]["num_steps"],
     }
@@ -726,6 +724,10 @@ def summarize_long_results(long_results, group_cols=("dataset", "method"), inclu
             values = pd.to_numeric(group["oracle_gap_closed"], errors="coerce")
             row["oracle_gap_closed_mean"] = values.mean()
             row["oracle_gap_closed_std"] = values.std()
+        if "relative_loss_improvement_pct" in group.columns:
+            values = pd.to_numeric(group["relative_loss_improvement_pct"], errors="coerce")
+            row["relative_loss_improvement_pct_mean"] = values.mean()
+            row["relative_loss_improvement_pct_std"] = values.std()
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -765,6 +767,10 @@ def save_nonstationary_table(summary_df, output_dir):
         rows.append({
             "Method": row["method"],
             "Loss": format_mean_std(row["loss_mean"], row["loss_std"], 4),
+            "Relative Loss Improvement vs Pretrained (%)": format_mean_std(
+                row.get("relative_loss_improvement_pct_mean", float("nan")),
+                row.get("relative_loss_improvement_pct_std", float("nan")), 2,
+            ),
             "Deployment Time / Batch (s)": format_mean_std(row["total_time_mean"], row["total_time_std"], 2),
         })
     table = pd.DataFrame(rows)
@@ -775,18 +781,18 @@ def save_nonstationary_table(summary_df, output_dir):
     with open(os.path.join(output_dir, "nonstationary_overall_comparison_table.tex"), "w", encoding="utf-8") as f:
         f.write(table.to_latex(index=False, escape=False))
 
-
 def save_method_comparison_table(output_dir):
     rows = [
         {"Method": "Pretrained", "Deployment signal": "None", "State": "Fixed", "Frequency": "Never"},
         {"Method": "Best Single FT", "Deployment signal": "First batch", "State": "Fixed after B1", "Frequency": "Once"},
         {"Method": "Mixed-source FT", "Deployment signal": "None", "State": "Fixed", "Frequency": "Never"},
-        {"Method": "Episodic Tent", "Deployment signal": "Current unlabeled batch B", "State": "Reset to Mixed FT", "Frequency": "Every batch"},
-        {"Method": "Online Tent", "Deployment signal": "Current unlabeled batch B", "State": "Carried across batches", "Frequency": "Every batch"},
-        {"Method": "Hard Routing", "Deployment signal": "Current unlabeled batch B", "State": "Recomputed", "Frequency": "Every batch"},
-        {"Method": "Flat Routing", "Deployment signal": "Current unlabeled batch B", "State": "Recomputed", "Frequency": "Every batch"},
+        {"Method": "Static TENT (Best Single-FT)", "Deployment signal": "First batch", "State": "TENT-adapted then frozen", "Frequency": "Once"},
+        {"Method": "TENT (Best Single-FT)", "Deployment signal": "Current batch", "State": "Carried across batches", "Frequency": "Every batch after B1 selection"},
+        {"Method": "Hard Routing", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
+        {"Method": "Flat Routing", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
         {"Method": "Static Hierarchical Routing", "Deployment signal": "First batch", "State": "Frozen after B1", "Frequency": "Once"},
-        {"Method": "Hierarchical Routing", "Deployment signal": "Current unlabeled batch B", "State": "Recomputed", "Frequency": "Every batch"},
+        {"Method": "Hierarchical Routing", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
+        {"Method": "TENT (Hierarchical Routing)", "Deployment signal": "B1 routing + current batch", "State": "TENT state carried after B1", "Frequency": "Hierarchical once, TENT every batch"},
         {"Method": "Target-FT Oracle", "Deployment signal": "Target training data", "State": "Fixed", "Frequency": "Offline; Primary only"},
     ]
     pd.DataFrame(rows).to_csv(os.path.join(output_dir, "method_comparison.csv"), index=False)
@@ -803,13 +809,15 @@ def save_method_comparison_table(output_dir):
 #   * Each deployment dataset D is evaluated independently.
 #   * Batches start after deployment_offset_tokens (512k by default) because
 #     the Target-FT Oracle may have seen earlier target tokens during training.
-#   * A SINGLE batch B is used for selection/adaptation AND final evaluation.
-#     This is intentional: the objective is transductive deployment on B.
-#   * Static Hierarchical Routing is solved on B1 and frozen for B2...BT.
-#   * Hierarchical Routing is solved again on every batch.
-#   * Episodic Tent reloads Mixed FT before every batch.
-#   * Online Tent carries state across batches of the same dataset, but is reset
-#     when the next deployment dataset starts.
+#   * The same incoming batch B is used for selection/adaptation and evaluation;
+#     this is intentional transductive test-time adaptation.
+#   * Best Single-FT is selected once on B1. TENT (Best Single-FT) starts from
+#     that checkpoint and then adapts online; Static TENT performs only the B1
+#     update and freezes the resulting model.
+#   * Static Hierarchical Routing is solved on B1 and frozen. Per-batch
+#     Hierarchical Routing is recomputed on every batch.
+#   * TENT (Hierarchical Routing) performs its own shorter Hierarchical Routing
+#     optimization on B1, then continues with online TENT only.
 #   * Target-FT Oracle is evaluated here, so Oracle Gap Closed is computed per
 #     batch and only then averaged.
 #   * PCA/grid diagnostics are preserved on B1 of every deployment dataset and
@@ -836,13 +844,17 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
         save_json(os.path.join(dataset_dir, "dataset_stats.json"), stats)
 
         best_single, best_single_time = None, 0.0
-        if "best_single_ft" in methods:
+        best_needed = any(m in methods for m in ["best_single_ft", "static_tent_best_single", "tent_best_single"])
+        if best_needed:
             best_single, best_single_time, scores = select_best_single_ft(bank_df, batches[0], device, EXPERIMENT_CONFIG)
             scores.to_csv(os.path.join(dataset_dir, "best_single_ft_selection.csv"), index=False)
 
-        online_state, online_init_time = None, 0.0
-        if "online_tent" in methods:
-            online_state, online_init_time = init_online_tent(device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
+        static_tent_state = tent_best_state = tent_hier_state = None
+        static_tent_init_time = tent_best_init_time = tent_hier_init_time = 0.0
+        if "static_tent_best_single" in methods:
+            static_tent_state, static_tent_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
+        if "tent_best_single" in methods:
+            tent_best_state, tent_best_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
 
         static_hier_model = None
         dataset_wide, dataset_long = [], []
@@ -859,14 +871,22 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
                     results.append(run_best_single_ft(batch, best_single, best_single_time, batch_id, device))
                 if "mixed_ft" in methods:
                     results.append(run_mixed_ft(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
-                if "episodic_tent" in methods:
-                    results.append(run_episodic_tent(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
-                if "online_tent" in methods:
-                    results.append(run_online_tent_batch(online_state, batch, batch_id, online_init_time, device))
+
+                if "static_tent_best_single" in methods:
+                    if batch_id == 0:
+                        result = run_tent_batch(static_tent_state, batch, batch_id, static_tent_init_time, device, "Static TENT (Best Single-FT)")
+                        result["adaptation_recomputed"] = True
+                        results.append(result)
+                    else:
+                        results.append(evaluate_static_tent(static_tent_state["model"], batch, device))
+                if "tent_best_single" in methods:
+                    results.append(run_tent_batch(tent_best_state, batch, batch_id, tent_best_init_time, device, "TENT (Best Single-FT)"))
                 if "oracle" in methods:
                     results.append(run_oracle(dataset_name, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY))
 
-                routing_needed = any(m in methods for m in ["hard", "flat", "hierarchical"]) or ("static_hierarchical" in methods and batch_id == 0)
+                routing_needed = any(m in methods for m in ["hard", "flat", "hierarchical"]) or (
+                    batch_id == 0 and any(m in methods for m in ["static_hierarchical", "tent_hierarchical"])
+                )
                 scored = pretrained_loss = scoring_time = None
                 if routing_needed:
                     scored, pretrained_loss, scoring_time = compute_shared_routing_scores(bank_df, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
@@ -879,17 +899,28 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
                     results.append(flat_result)
                     save_flat_details(batch_dir, flat_info)
 
-                # On B1, Static Hierarchical and per-batch Hierarchical are the same
-                # routing decision. Build it once physically, report both methods,
-                # and keep that model alive as the frozen static composition.
+                # Normal HR remains the source for Static HR and B1 PCA/grid diagnostics.
                 hier_info = None
-                if batch_id == 0 and ("hierarchical" in methods or "static_hierarchical" in methods):
+                hier_b1_needed = batch_id == 0 and any(m in methods for m in ["hierarchical", "static_hierarchical", "tent_hierarchical"])
+                if hier_b1_needed:
                     hier_model, hier_result, hier_info = build_hierarchical_model(
                         metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                        EXPERIMENT_CONFIG, MODEL_REGISTRY, method_name="Hierarchical Routing",
+                        EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
                     )
                     if "hierarchical" in methods:
                         results.append(hier_result)
+                    if "tent_hierarchical" in methods:
+                        # TENT has its own B1 HR solve; only bank scores are shared.
+                        tent_hier_model, tent_hier_result, tent_hier_info = build_hierarchical_model(
+                            metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
+                            EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=True),
+                        )
+                        tent_hier_state, tent_hier_init_time = init_tent_from_model(
+                            tent_hier_model, tent_hier_result["total_time_sec"], device, EXPERIMENT_CONFIG,
+                        )
+                        results.append(run_tent_batch(
+                            tent_hier_state, batch, batch_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)",
+                        ))
                     if "static_hierarchical" in methods:
                         static_hier_model = hier_model
                         static_result = copy.deepcopy(hier_result)
@@ -908,11 +939,13 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
                     if "hierarchical" in methods:
                         hier_model, hier_result, hier_info = build_hierarchical_model(
                             metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                            EXPERIMENT_CONFIG, MODEL_REGISTRY, method_name="Hierarchical Routing",
+                            EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
                         )
                         results.append(hier_result)
                         save_hierarchical_details(batch_dir, hier_info)
                         clear_model(hier_model, device)
+                    if "tent_hierarchical" in methods:
+                        results.append(run_tent_batch(tent_hier_state, batch, batch_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)"))
 
                 add_oracle_gap(results)
                 base = build_base_row(EXPERIMENT_CONFIG, MODEL_REGISTRY, "primary_episodic", dataset_name, batch_id, offset)
@@ -932,7 +965,9 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
             dataset_summary.to_csv(os.path.join(dataset_dir, "summary_results.csv"), index=False)
         finally:
             clear_model(static_hier_model, device)
-            clear_online_tent(online_state, device)
+            clear_online_tent(static_tent_state, device)
+            clear_online_tent(tent_best_state, device)
+            clear_online_tent(tent_hier_state, device)
 
     summary = summarize_long_results(all_long, include_oracle_gap=True)
     summary.to_csv(os.path.join(out, "summary_results.csv"), index=False)
@@ -949,22 +984,20 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
 #   incoming batches come from different domains?
 #
 # Protocol:
-#   * No Target-FT Oracle is used, therefore there is no Oracle Gap Closed and
-#     no need for the 512k Oracle-protection offset. Offset defaults to 0.
-#   * Source datasets and deployment datasets MUST be disjoint; validation
-#     fails before the run if any overlap exists.
-#   * A balanced random stream is generated with a fixed seed. Each deployment
-#     domain contributes equally (up to at most one-batch remainder), then the
-#     sequence is shuffled and saved before evaluation.
-#   * The same incoming batch B is used for selection/adaptation and evaluation.
-#   * Static Hierarchical Routing is solved only on stream batch 1 and then
-#     frozen, even when later batches switch to different domains.
-#   * Hierarchical/Hard/Flat reroute on every incoming batch.
-#   * Episodic Tent resets to Mixed FT for every batch.
-#   * Online Tent keeps its adapted parameters and optimizer state through the
-#     whole stream, including across domain changes.
-#   * PCA/grid diagnostics are preserved on stream batch 1 only and are not
-#     counted in Hierarchical Routing runtime.
+#   * No Target-FT Oracle is used; offset therefore defaults to 0.
+#   * Source and deployment datasets must be disjoint.
+#   * A balanced random stream is generated with a fixed seed and saved before
+#     evaluation. The same batch is used for adaptation and evaluation.
+#   * Best Single-FT is selected once on stream B1. Static TENT freezes after
+#     its B1 update; online TENT keeps adapting across all domain switches.
+#   * Static Hierarchical Routing is solved only on B1 and frozen. Hard, Flat
+#     and ordinary Hierarchical Routing reroute on every incoming batch.
+#   * TENT (Hierarchical Routing) performs its own shorter Hierarchical Routing
+#     optimization on B1, then keeps only its online TENT state through the stream.
+#   * Relative Loss Improvement is computed per batch against Pretrained before
+#     averaging: 100 * (L_pretrained - L_method) / L_pretrained.
+#   * PCA/grid diagnostics are preserved on stream B1 only and are not counted
+#     in Hierarchical Routing runtime.
 
 
 def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
@@ -996,13 +1029,17 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
     first_dataset = sequence[0]
     first_batch = dataset_batches[first_dataset][0]
     best_single, best_single_time = None, 0.0
-    if "best_single_ft" in methods:
+    best_needed = any(m in methods for m in ["best_single_ft", "static_tent_best_single", "tent_best_single"])
+    if best_needed:
         best_single, best_single_time, scores = select_best_single_ft(bank_df, first_batch, device, EXPERIMENT_CONFIG)
         scores.to_csv(os.path.join(out, "best_single_ft_selection.csv"), index=False)
 
-    online_state, online_init_time = None, 0.0
-    if "online_tent" in methods:
-        online_state, online_init_time = init_online_tent(device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
+    static_tent_state = tent_best_state = tent_hier_state = None
+    static_tent_init_time = tent_best_init_time = tent_hier_init_time = 0.0
+    if "static_tent_best_single" in methods:
+        static_tent_state, static_tent_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
+    if "tent_best_single" in methods:
+        tent_best_state, tent_best_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
 
     static_hier_model = None
     all_wide, all_long = [], []
@@ -1022,12 +1059,19 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
                 results.append(run_best_single_ft(batch, best_single, best_single_time, stream_id, device))
             if "mixed_ft" in methods:
                 results.append(run_mixed_ft(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
-            if "episodic_tent" in methods:
-                results.append(run_episodic_tent(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
-            if "online_tent" in methods:
-                results.append(run_online_tent_batch(online_state, batch, stream_id, online_init_time, device))
+            if "static_tent_best_single" in methods:
+                if stream_id == 0:
+                    result = run_tent_batch(static_tent_state, batch, stream_id, static_tent_init_time, device, "Static TENT (Best Single-FT)")
+                    result["adaptation_recomputed"] = True
+                    results.append(result)
+                else:
+                    results.append(evaluate_static_tent(static_tent_state["model"], batch, device))
+            if "tent_best_single" in methods:
+                results.append(run_tent_batch(tent_best_state, batch, stream_id, tent_best_init_time, device, "TENT (Best Single-FT)"))
 
-            routing_needed = any(m in methods for m in ["hard", "flat", "hierarchical"]) or ("static_hierarchical" in methods and stream_id == 0)
+            routing_needed = any(m in methods for m in ["hard", "flat", "hierarchical"]) or (
+                stream_id == 0 and any(m in methods for m in ["static_hierarchical", "tent_hierarchical"])
+            )
             scored = pretrained_loss = scoring_time = None
             if routing_needed:
                 scored, pretrained_loss, scoring_time = compute_shared_routing_scores(bank_df, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
@@ -1040,13 +1084,26 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
                 results.append(flat_result)
                 save_flat_details(batch_dir, flat_info)
 
-            if stream_id == 0 and ("hierarchical" in methods or "static_hierarchical" in methods):
+            hier_b1_needed = stream_id == 0 and any(m in methods for m in ["hierarchical", "static_hierarchical", "tent_hierarchical"])
+            if hier_b1_needed:
                 hier_model, hier_result, hier_info = build_hierarchical_model(
                     metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                    EXPERIMENT_CONFIG, MODEL_REGISTRY, method_name="Hierarchical Routing",
+                    EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
                 )
                 if "hierarchical" in methods:
                     results.append(hier_result)
+                if "tent_hierarchical" in methods:
+                    # TENT has its own B1 HR solve; only bank scores are shared.
+                    tent_hier_model, tent_hier_result, tent_hier_info = build_hierarchical_model(
+                        metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
+                        EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=True),
+                    )
+                    tent_hier_state, tent_hier_init_time = init_tent_from_model(
+                        tent_hier_model, tent_hier_result["total_time_sec"], device, EXPERIMENT_CONFIG,
+                    )
+                    results.append(run_tent_batch(
+                        tent_hier_state, batch, stream_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)",
+                    ))
                 if "static_hierarchical" in methods:
                     static_hier_model = hier_model
                     static_result = copy.deepcopy(hier_result)
@@ -1065,12 +1122,15 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
                 if "hierarchical" in methods:
                     hier_model, hier_result, hier_info = build_hierarchical_model(
                         metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                        EXPERIMENT_CONFIG, MODEL_REGISTRY, method_name="Hierarchical Routing",
+                        EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
                     )
                     results.append(hier_result)
                     save_hierarchical_details(batch_dir, hier_info)
                     clear_model(hier_model, device)
+                if "tent_hierarchical" in methods:
+                    results.append(run_tent_batch(tent_hier_state, batch, stream_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)"))
 
+            add_relative_loss_improvement(results)
             base = build_base_row(EXPERIMENT_CONFIG, MODEL_REGISTRY, "nonstationary_stream", dataset_name, stream_id, offset)
             base["stream_batch_id"] = stream_id + 1
             base["dataset_local_batch_id"] = idx + 1
@@ -1083,7 +1143,9 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
                 pd.DataFrame(all_long).to_csv(os.path.join(out, "nonstationary_batch_results.csv"), index=False)
     finally:
         clear_model(static_hier_model, device)
-        clear_online_tent(online_state, device)
+        clear_online_tent(static_tent_state, device)
+        clear_online_tent(tent_best_state, device)
+        clear_online_tent(tent_hier_state, device)
 
     summary = summarize_long_results(all_long, group_cols=("method",), include_oracle_gap=False)
     summary.to_csv(os.path.join(out, "summary_results.csv"), index=False)

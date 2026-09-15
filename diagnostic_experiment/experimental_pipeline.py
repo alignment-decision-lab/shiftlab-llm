@@ -271,19 +271,34 @@ DATASET_REGISTRY = {
 #   - the methods enabled inside each protocol.
 #
 # Primary Episodic:
-#   Each deployment dataset is evaluated independently. The default 512k-token
-#   offset keeps evaluation data separate from the portion potentially used by
-#   target-FT Oracle training. Online Tent carries state across batches of the
-#   same dataset, then resets before the next deployment dataset.
-#   A deployment with oracle_name=None is still valid: routing_test.py records
-#   the Oracle and Oracle Gap Closed as NaN for that dataset, while all other
-#   methods continue to run normally.
+#   Each deployment dataset is evaluated independently. The 512k-token offset
+#   separates evaluation from data potentially used for target-FT Oracle training.
+#   TENT state is retained across batches, then reset for the next dataset.
+#   If oracle_name=None, Oracle and Oracle Gap Closed are recorded as NaN;
+#   the other methods still run normally.
 #
 # Non-stationary Stream:
-#   Batches from the deployment domains are interleaved in a balanced random
-#   order. There is no Oracle and no Oracle Gap Closed. The stream starts at
-#   token offset 0. Online Tent keeps its state across domain switches.
-#   Sources and non-stationary deployment domains MUST be disjoint.
+#   Deployment batches are interleaved in balanced random order from offset 0.
+#   TENT state persists across domain switches. Sources and deployments must
+#   be disjoint. No Oracle is used; Relative Loss Improvement vs Pretrained (%)
+#   is computed per batch as 100 * (L_pretrained - L_method) / L_pretrained,
+#   then summarized across batches.
+#
+# In both protocols, B1 is the first batch of the dataset (Primary) or stream:
+#   - TENT (Best Single-FT): select Best Single-FT on B1, then adapt online.
+#   - Static TENT (Best Single-FT): the same selection and adaptation on B1,
+#     then freeze the resulting model for all subsequent batches.
+#   - Static HR: run normal HR on B1, then freeze the resulting model.
+#   - Normal HR (and Hard/Flat Routing): reroute on every batch.
+#   - TENT (HR): run its own short HR optimization on B1, then apply TENT;
+#     subsequent batches use only online TENT, with no further routing.
+#     tent_hierarchical overrides only num_iters; other HR settings are shared.
+#     Two iterations are chosen to reduce the cost before TENT, not as an optimum.
+#   TENT uses lr=1e-3 and one update per adapted batch. Its B1 deployment time
+#   includes Best Single-FT selection or short HR, loading/initialization as
+#   applicable, and TENT. Later online batches incur only the TENT batch cost.
+#   PCA/grid uses normal HR on B1 of each Primary dataset or B1 of the stream;
+#   diagnostic runtime is excluded from routing runtime.
 
 EXPERIMENT_1_CONFIG = {
     "experiment_name": "exp1_arxiv_freelaw_pubmedcentral",
@@ -317,6 +332,7 @@ EXPERIMENT_1_CONFIG = {
         "dirichlet_concentration": 1.0,
         "seed": 42,
     },
+    "tent_hierarchical": {"num_iters": 2},
     "flat": {
         "tau": 1.0,
     },
@@ -339,12 +355,13 @@ EXPERIMENT_1_CONFIG = {
             "pretrained",
             "best_single_ft",
             "mixed_ft",
-            "episodic_tent",
-            "online_tent",
+            "static_tent_best_single",
+            "tent_best_single",
             "hard",
             "flat",
             "static_hierarchical",
             "hierarchical",
+            "tent_hierarchical",
             "oracle",
         ],
     },
@@ -359,12 +376,13 @@ EXPERIMENT_1_CONFIG = {
             "pretrained",
             "best_single_ft",
             "mixed_ft",
-            "episodic_tent",
-            "online_tent",
+            "static_tent_best_single",
+            "tent_best_single",
             "hard",
             "flat",
             "static_hierarchical",
             "hierarchical",
+            "tent_hierarchical",
         ],
     },
 }
@@ -403,6 +421,7 @@ EXPERIMENT_2_CONFIG = {
         "dirichlet_concentration": 1.0,
         "seed": 42,
     },
+    "tent_hierarchical": {"num_iters": 2},
     "flat": {
         "tau": 1.0,
     },
@@ -423,12 +442,13 @@ EXPERIMENT_2_CONFIG = {
             "pretrained",
             "best_single_ft",
             "mixed_ft",
-            "episodic_tent",
-            "online_tent",
+            "static_tent_best_single",
+            "tent_best_single",
             "hard",
             "flat",
             "static_hierarchical",
             "hierarchical",
+            "tent_hierarchical",
             "oracle",
         ],
     },
@@ -443,12 +463,13 @@ EXPERIMENT_2_CONFIG = {
             "pretrained",
             "best_single_ft",
             "mixed_ft",
-            "episodic_tent",
-            "online_tent",
+            "static_tent_best_single",
+            "tent_best_single",
             "hard",
             "flat",
             "static_hierarchical",
             "hierarchical",
+            "tent_hierarchical",
         ],
     },
 }
@@ -492,6 +513,7 @@ EXPERIMENT_3_CONFIG = {
         "dirichlet_concentration": 1.0,
         "seed": 42,
     },
+    "tent_hierarchical": {"num_iters": 2},
     "flat": {
         "tau": 1.0,
     },
@@ -512,12 +534,13 @@ EXPERIMENT_3_CONFIG = {
             "pretrained",
             "best_single_ft",
             "mixed_ft",
-            "episodic_tent",
-            "online_tent",
+            "static_tent_best_single",
+            "tent_best_single",
             "hard",
             "flat",
             "static_hierarchical",
             "hierarchical",
+            "tent_hierarchical",
             "oracle",
         ],
     },
@@ -532,12 +555,109 @@ EXPERIMENT_3_CONFIG = {
             "pretrained",
             "best_single_ft",
             "mixed_ft",
-            "episodic_tent",
-            "online_tent",
+            "static_tent_best_single",
+            "tent_best_single",
             "hard",
             "flat",
             "static_hierarchical",
             "hierarchical",
+            "tent_hierarchical",
+        ],
+    },
+}
+
+EXPERIMENT_4_CONFIG = {
+    "experiment_name": "exp4_pubmedcentral_arxiv_pg19",
+    "model": "small",
+
+    # Three broad source domains chosen to cover scientific/biomedical
+    # writing and long-form books.
+    "sources": [
+        "PubMed Central",
+        "ArXiv",
+        "PG-19",
+    ],
+    "mixed_ft": {
+        "subfolder": "gpt2-small/Mixed_FT_PubMed_Central_ArXiv_PG-19/model",
+    },
+
+    # All remaining bank domains with a target-FT Oracle.
+    "deployments": [
+        "DM Mathematics",
+        "EuroParl",
+        "FreeLaw",
+        "GitHub",
+        "OWT2",
+        "PubMed Abstracts",
+        "StackExchange",
+        "Wikipedia",
+    ],
+
+    "context_length": 512,
+    "batch_size": 16,
+
+    # Normal Hierarchical Routing.
+    "hierarchical": {
+        "H": 3,
+        "num_iters": 20,
+        "lr": 0.1,
+        "num_random_starts": 5,
+        "dirichlet_concentration": 1.0,
+        "seed": 42,
+    },
+
+    # Short HR initialization used only by TENT (Hierarchical Routing).
+    "tent_hierarchical": {"num_iters": 5},
+
+    "flat": {
+        "tau": 1.0,
+    },
+
+    "tent": {
+        "lr": 1e-3,
+        "num_steps": 1,
+    },
+
+    # PCA/grid uses normal HR on B1; diagnostic time is excluded
+    # from routing deployment time.
+    "run_pca": True,
+    "progressive_save": True,
+    "seed": 42,
+
+    "primary_episodic": {
+        "enabled": True,
+        "num_batches": 50,
+        "deployment_offset_tokens": 512_000,
+        "methods": [
+            "pretrained",
+            "best_single_ft",
+            "static_tent_best_single",
+            "tent_best_single",
+            "hard",
+            "flat",
+            "static_hierarchical",
+            "hierarchical",
+            "tent_hierarchical",
+            "oracle",
+        ],
+    },
+
+    "nonstationary_stream": {
+        "enabled": True,
+        "num_online_batches": 24,
+        "deployment_offset_tokens": 0,
+        "sampling": "balanced_random",
+        "seed": 42,
+        "methods": [
+            "pretrained",
+            "best_single_ft",
+            "static_tent_best_single",
+            "tent_best_single",
+            "hard",
+            "flat",
+            "static_hierarchical",
+            "hierarchical",
+            "tent_hierarchical",
         ],
     },
 }
@@ -546,8 +666,9 @@ EXPERIMENT_3_CONFIG = {
 # Only configurations listed here are executed, in this exact order.
 EXPERIMENTS = [
     # EXPERIMENT_1_CONFIG,
-    EXPERIMENT_2_CONFIG,
+    # EXPERIMENT_2_CONFIG,
     # EXPERIMENT_3_CONFIG,
+    EXPERIMENT_4_CONFIG,
 ]
 
 

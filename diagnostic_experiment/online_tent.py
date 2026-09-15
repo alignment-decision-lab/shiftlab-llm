@@ -1,21 +1,24 @@
-"""CE-based, LayerNorm-affine-only online test-time adaptation.
+"""CE-based, LayerNorm-affine-only online test-time adaptation for causal LMs.
 
-GPT-2 analog of TENT's mechanism, using the causal-LM cross-entropy
-loss instead of prediction entropy.
+This is a GPT-2 adaptation of TENT's online mechanism. Instead of prediction
+entropy, it minimizes the causal-LM next-token cross-entropy because labels
+are directly available from the input sequence.
 
-The model is initialized once from the Mixed-FT checkpoint. For each
-incoming deployment batch, the full batch is used for both adaptation
-and evaluation: B_t -> theta_t -> L_{B_t}(theta_t). Unlike episodic
-Tent, the adapted LayerNorm parameters and optimizer state are retained
-and become the starting point for the next batch.
+The starting model is provided by the experimental pipeline rather than
+loaded here. This allows the same TENT implementation to be initialized from:
+    - Best Single-FT;
+    - Hierarchical Routing.
 
-In the Primary Episodic protocol, a new online state must be created
-at the beginning of each deployment dataset. In the Non-stationary
-Stream protocol, the same state is kept across domain switches.
+TENT is online: after adapting on batch B_t, the adapted LayerNorm parameters
+and optimizer state are retained for B_{t+1}. With num_steps=1, one gradient
+update is performed per incoming batch.
+
+Static TENT is handled by the experimental pipeline: TENT is applied on the
+first batch and the resulting model is then frozen for subsequent batches.
 """
 
 import torch
-from transformers import AutoModelForCausalLM
+
 
 DEFAULT_CONFIG = {
     "lr": 1e-3,
@@ -45,7 +48,7 @@ def configure_ln_affine(model):
 
 
 def _move_batch_to_device(batch, device):
-    return {k: v.to(device) for k, v in batch.items()}
+    return {key: value.to(device) for key, value in batch.items()}
 
 
 def _compute_loss(model, batch):
@@ -54,32 +57,20 @@ def _compute_loss(model, batch):
         return float(model(**batch).loss.item())
 
 
-def load_base_model(base_model_name_or_path, device, bank_repo_id=None):
-    """Load Tent's starting model locally/publicly or from a HF bank subfolder."""
-    if bank_repo_id is not None:
-        model = AutoModelForCausalLM.from_pretrained(bank_repo_id, subfolder=base_model_name_or_path)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(base_model_name_or_path)
-
-    model = model.to(device)
-    model.eval()
-    return model
-
-
-def initialize_online_tent(base_model_name_or_path, device, config=None, bank_repo_id=None):
-    """Initialize the persistent online Tent model and optimizer."""
+def initialize_online_tent(model, device, config=None):
+    """Initialize persistent online TENT from an already constructed model."""
     config = {**DEFAULT_CONFIG, **(config or {})}
 
     if config["num_steps"] <= 0:
         raise ValueError("num_steps must be > 0.")
+    if config["lr"] <= 0:
+        raise ValueError("lr must be > 0.")
 
-    model = load_base_model(
-        base_model_name_or_path=base_model_name_or_path,
-        device=device,
-        bank_repo_id=bank_repo_id,
-    )
+    model = model.to(device)
+    model.eval()
+
     ln_params = configure_ln_affine(model)
-    optimizer = torch.optim.Adam(ln_params, lr=config["lr"])
+    optimizer = torch.optim.Adam(ln_params, lr=float(config["lr"]))
 
     return {
         "model": model,
@@ -91,7 +82,7 @@ def initialize_online_tent(base_model_name_or_path, device, config=None, bank_re
 
 
 def run_online_tent_batch(state, batch, device, canary_batch=None):
-    """Adapt the persistent online model on one full batch and evaluate on that same batch."""
+    """Adapt persistent TENT state on one full batch and evaluate on that batch."""
     model = state["model"]
     optimizer = state["optimizer"]
     ln_params = state["ln_params"]
@@ -106,14 +97,13 @@ def run_online_tent_batch(state, batch, device, canary_batch=None):
 
     model.train()
     for _ in range(config["num_steps"]):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss = model(**batch).loss
         loss.backward()
         optimizer.step()
 
     loss_after = _compute_loss(model, batch)
     canary_loss_after = _compute_loss(model, canary_batch) if canary_batch is not None else None
-
     state["num_batches_seen"] += 1
 
     info = {

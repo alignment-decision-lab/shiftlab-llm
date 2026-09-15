@@ -298,10 +298,7 @@ def plot_candidate_edges(
 
 def plot_candidate_vertices(ax, info, coordinate_dict):
     candidate_coords = np.stack(
-        [
-            coordinate_dict[name]
-            for name in info["candidate_names"]
-        ],
+        [coordinate_dict[name] for name in info["candidate_names"]],
         axis=0,
     )
 
@@ -314,42 +311,28 @@ def plot_candidate_vertices(ax, info, coordinate_dict):
 
         if name == "theta_0":
             ax.scatter(
-                coord[0],
-                coord[1],
-                marker="D",
-                s=190,
-                color="black",
-                zorder=8,
+                coord[0], coord[1],
+                marker="D", s=190, color="black", zorder=8,
             )
-
             label = r"$\theta_0$"
 
         else:
             ax.scatter(
-                coord[0],
-                coord[1],
-                s=170,
-                edgecolor="black",
-                linewidth=1.0,
-                zorder=8,
+                coord[0], coord[1],
+                s=170, edgecolor="black", linewidth=1.0, zorder=8,
             )
 
             label = name
-
             if name in info.get("selected_lambdas", {}):
-                label = (
-                    f"{name}, "
-                    f"λ={info['selected_lambdas'][name]:g}"
-                )
+                label = f"{name}, λ={info['selected_lambdas'][name]:g}"
 
-        # Keep annotations inside the plotting area.
+        # Keep all candidate labels inside the useful plotting area.
         #
-        # In particular, put the right-most candidate below
-        # and to the left of its vertex. This prevents labels
-        # such as "ArXiv, λ=..." from running underneath the
-        # legend in the loss-landscape figure.
+        # The right-most candidate receives additional vertical separation:
+        # its label is placed clearly below and to the left of the vertex so
+        # that long labels do not run underneath the loss-landscape legend.
         if coord[0] >= x_max - 0.08 * x_span:
-            xytext = (-18, -14)
+            xytext = (-20, -24)
             ha = "right"
             va = "top"
 
@@ -1196,10 +1179,7 @@ def plot_pca_loss_landscape(
     output_dir,
 ):
     """Visualize grid loss landscape for any H in the common PCA plane."""
-    os.makedirs(
-        output_dir,
-        exist_ok=True,
-    )
+    os.makedirs(output_dir, exist_ok=True)
 
     grid_pca_df = compute_grid_pca_coordinates(
         info,
@@ -1207,36 +1187,19 @@ def plot_pca_loss_landscape(
         grid_df,
     )
 
-    x = grid_pca_df[
-        "PC1"
-    ].to_numpy()
+    x = grid_pca_df["PC1"].to_numpy()
+    y = grid_pca_df["PC2"].to_numpy()
+    losses = grid_pca_df["loss"].to_numpy()
+    K = len(info["candidate_names"])
 
-    y = grid_pca_df[
-        "PC2"
-    ].to_numpy()
-
-    losses = grid_pca_df[
-        "loss"
-    ].to_numpy()
-
-    K = len(
-        info["candidate_names"]
-    )
-
-    fig, ax = plt.subplots(
-        figsize=(17, 11.5)
-    )
-
+    # Slightly wider figure so the legend, candidate labels and colorbar
+    # all have enough horizontal room.
+    fig, ax = plt.subplots(figsize=(18.5, 11.5))
     cmap = make_light_colormap()
 
     # H=3: true triangular 2D simplex -> contour heatmap.
     if K == 3:
-        triangulation = (
-            mtri.Triangulation(
-                x,
-                y,
-            )
-        )
+        triangulation = mtri.Triangulation(x, y)
 
         heatmap = ax.tricontourf(
             triangulation,
@@ -1250,23 +1213,18 @@ def plot_pca_loss_landscape(
         cbar = fig.colorbar(
             heatmap,
             ax=ax,
-            pad=0.055,
-            fraction=0.046,
+            pad=0.065,
+            fraction=0.042,
         )
 
-    # H=2: line simplex; H>3:
-    # higher-dimensional simplex projected into PCA.
+    # H=2: line simplex; H>3: higher-dimensional simplex projected into PCA.
     else:
         scatter = ax.scatter(
             x,
             y,
             c=losses,
             cmap=cmap,
-            s=(
-                85
-                if K > 3
-                else 130
-            ),
+            s=85 if K > 3 else 130,
             alpha=0.75,
             edgecolor="none",
             zorder=2,
@@ -1275,18 +1233,15 @@ def plot_pca_loss_landscape(
         cbar = fig.colorbar(
             scatter,
             ax=ax,
-            pad=0.055,
-            fraction=0.046,
+            pad=0.065,
+            fraction=0.042,
         )
 
     cbar.set_label(
         "Routing batch loss",
         fontsize=FONT_SIZE_AXES,
     )
-
-    cbar.ax.tick_params(
-        labelsize=FONT_SIZE_TICKS
-    )
+    cbar.ax.tick_params(labelsize=FONT_SIZE_TICKS)
 
     plot_candidate_edges(
         ax,
@@ -1323,38 +1278,37 @@ def plot_pca_loss_landscape(
         explained_var,
     )
 
+    # Extra space on the right separates the right-most candidate and its
+    # annotation from the legend. This is especially useful when candidate
+    # names such as "StackExchange, λ=..." are long.
     set_pca_limits(
         ax,
         coordinate_dict,
-        right_margin=0.48,
+        right_margin=0.70,
         left_margin=0.18,
         bottom_margin=0.20,
         top_margin=0.20,
     )
 
-    # Two-line title: keeps the loss information
-    # away from the colorbar on the right.
     ax.set_title(
         (
             "Routing loss landscape\n"
-            f"Hierarchical optimum loss: "
-            f"{grid_summary['eg_best_loss']:.4f} | "
-            f"Grid-search optimum loss: "
-            f"{grid_summary['grid_best_loss']:.4f}"
+            f"Hierarchical optimum loss: {grid_summary['eg_best_loss']:.4f} | "
+            f"Grid-search optimum loss: {grid_summary['grid_best_loss']:.4f}"
         ),
         fontsize=FONT_SIZE_LEGEND,
         pad=16,
     )
 
+    # Keep the legend as high and as far right as possible. Together with
+    # the larger PCA right margin, this leaves a clear region for long
+    # candidate labels underneath it.
     ax.legend(
         fontsize=FONT_SIZE_LEGEND,
         facecolor="white",
         framealpha=0.95,
         loc="upper right",
-        bbox_to_anchor=(
-            0.985,
-            0.985,
-        ),
+        bbox_to_anchor=(0.995, 0.995),
         borderaxespad=0.0,
     )
 
@@ -1363,11 +1317,10 @@ def plot_pca_loss_landscape(
         adjustable="box",
     )
 
-    # Slightly more room at the top for the two-line title,
-    # while still reserving space for the colorbar.
+    # Reserve sufficient room for both the two-line title and colorbar.
     fig.subplots_adjust(
-        left=0.10,
-        right=0.86,
+        left=0.09,
+        right=0.87,
         bottom=0.12,
         top=0.88,
     )
@@ -1381,7 +1334,7 @@ def plot_pca_loss_landscape(
         path,
         dpi=300,
         bbox_inches="tight",
-        pad_inches=0.15,
+        pad_inches=0.18,
     )
 
     plt.close(fig)
