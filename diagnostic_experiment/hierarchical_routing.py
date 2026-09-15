@@ -1,34 +1,24 @@
-"""Hierarchical Routing: the paper's proposed deployment-time routing
-strategy (Algorithm 2, "Hierarchical (ours)" branch), as opposed to the
-closest-source + fixed-midpoint strategy in algorithm_2.py.
+"""Hierarchical Routing: the paper's deployment-time routing strategy.
 
 Given an incoming unlabeled batch B and a model bank
-M = {theta_0} U {theta_{j,lambda} : j in sources, lambda in Lambda_j}:
+M = {theta_0} U {theta_{j,lambda}}:
 
-1. Score every bank checkpoint by its own loss on B (no separate distance
-   measure -- same s(theta;B) used everywhere in the paper).
-2. For each source j, alpha_j(B) = -min_lambda L_hat_B(theta_{j,lambda}) and
-   lambda*_j(B) = argmin_lambda L_hat_B(theta_{j,lambda}) come from the same
-   pass over that source's robustness grid.
-3. Keep the H sources with the largest alpha_j(B) (TopH).
-4. Build a small candidate set C_B = {theta_0} U {theta_{j,lambda*_j} : j in J_B}.
-5. Optimize interpolation weights w over the simplex Delta(C_B) via
-   exponentiated-gradient descent, from several starting points, comparing
-   against every simplex vertex.
-6. Compose theta_B = sum_k w*_k theta_k.
+1. Use the precomputed batch losses of every bank checkpoint and theta_0.
+2. For each source j:
+       lambda*_j(B) = argmin_lambda L_hat_B(theta_{j,lambda})
+       alpha_j(B) = -min_lambda L_hat_B(theta_{j,lambda})
+3. Consider theta_0 together with the best checkpoint of every source and
+   keep the H representatives with the smallest batch loss.
+4. Optimize interpolation weights w over the simplex Delta(C_B) via
+   exponentiated-gradient descent, from several starting points, and
+   compare against every simplex vertex.
+5. Compose:
+       theta_B = sum_k w*_k theta_k.
 
-Unlike algorithm_2.py, this never touches token-KL distributional distance
-at all -- every decision (source relevance, robustness level, interpolation
-weights) is driven by the same batch-loss measurement.
-
-Several hyperparameters used below (H, EG iteration count/step size, number
-of random restarts, Dirichlet concentration) are not given concrete values
-anywhere in the paper draft -- the defaults here are placeholders for you to
-tune, not validated experimental settings.
+All routing decisions are driven by the incoming-batch language-model loss.
 """
 
 import copy
-
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -39,12 +29,12 @@ from utils import move_batch_to_device
 
 try:
     from torch.func import functional_call
-except ImportError:  # torch < 2.0
+except ImportError:
     from torch.nn.utils.stateless import functional_call
 
 
 DEFAULT_CONFIG = {
-    "H": 2,
+    "H": 3,
     "num_iters": 100,
     "lr": 0.1,
     "num_random_starts": 5,
@@ -54,30 +44,46 @@ DEFAULT_CONFIG = {
 }
 
 
-# ------------------------------------------------------------------
-# Loading bank checkpoints
-# ------------------------------------------------------------------
+# ============================================================
+# MODEL LOADING
+# ============================================================
 
 def load_bank_checkpoint(row, bank_repo_id=None):
-    """Load one bank checkpoint, either from the Hub or from local disk."""
+    """Load one bank checkpoint from Hugging Face or local disk."""
     if bank_repo_id is not None:
         return AutoModelForCausalLM.from_pretrained(bank_repo_id, subfolder=row["subfolder"])
     return AutoModelForCausalLM.from_pretrained(row["save_dir"])
 
 
+def load_pretrained_checkpoint(pretrained_model_name, device=None, pretrained_subfolder=None, bank_repo_id=None):
+    """Load theta_0 from the model bank when configured, otherwise from Hugging Face."""
+    if pretrained_subfolder is not None:
+        if bank_repo_id is None:
+            raise ValueError("bank_repo_id is required when pretrained_subfolder is provided.")
+        model = AutoModelForCausalLM.from_pretrained(bank_repo_id, subfolder=pretrained_subfolder)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+
+    if device is not None:
+        model = model.to(device)
+
+    model.eval()
+    return model
+
+
 def filter_trained_rows(bank_df):
-    """Drop rows whose 'status' column marks them as not yet trained."""
+    """Drop rows explicitly marked as pending."""
     if "status" not in bank_df.columns:
         return bank_df
     return bank_df[bank_df["status"] != "pending"].reset_index(drop=True)
 
 
-# ------------------------------------------------------------------
-# Steps 1-3: score every bank checkpoint, derive alpha_j(B) and lambda*_j(B)
-# ------------------------------------------------------------------
+# ============================================================
+# BANK SCORING
+# ============================================================
 
 def compute_bank_batch_losses(bank_df, batch, device, bank_repo_id=None):
-    """Compute L_hat_B(theta_{j,lambda}) for every checkpoint in the bank."""
+    """Compute L_hat_B(theta_{j,lambda}) for every bank checkpoint."""
     losses = []
 
     for _, row in bank_df.iterrows():
@@ -85,21 +91,25 @@ def compute_bank_batch_losses(bank_df, batch, device, bank_repo_id=None):
         model.eval()
 
         with torch.no_grad():
-            outputs = model(**batch)
+            loss = model(**batch).loss.item()
 
-        losses.append(outputs.loss.item())
-
+        losses.append(float(loss))
         del model
+
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    scored = bank_df.copy()
-    scored["batch_loss"] = losses
-    return scored
+    scored_df = bank_df.copy()
+    scored_df["batch_loss"] = losses
+    return scored_df
 
+
+# ============================================================
+# SOURCE RELEVANCE AND CANDIDATE SELECTION
+# ============================================================
 
 def compute_source_relevance(scored_bank_df):
-    """Find the best-fitting robustness level and relevance score for each source."""
+    """Find lambda*_j(B), best loss and alpha_j(B) for each source."""
     rows = []
 
     for dataset_name, group in scored_bank_df.groupby("dataset_name"):
@@ -119,44 +129,89 @@ def compute_source_relevance(scored_bank_df):
 
 
 def select_top_h_sources(source_relevance_df, H):
-    """Keep the H sources with the largest alpha_j(B)."""
+    """Keep the H source families with the largest alpha_j(B)."""
     H = min(H, len(source_relevance_df))
     return source_relevance_df.sort_values("alpha", ascending=False).head(H).reset_index(drop=True)
 
 
-# ------------------------------------------------------------------
-# Step 4: candidate set C_B
-# ------------------------------------------------------------------
+def select_routing_candidates(source_relevance_df, pretrained_loss, H):
+    """Compete theta_0 against each source representative and keep H candidates total."""
+    rows = [{
+        "candidate_name": "theta_0",
+        "dataset_name": "theta_0",
+        "lambda_star": None,
+        "best_loss": float(pretrained_loss),
+        "alpha": -float(pretrained_loss),
+        "is_pretrained": True,
+    }]
 
-def build_candidate_state_dicts(top_sources_df, pretrained_model_name, device, bank_repo_id=None):
-    """Load theta_0 and selected per-source checkpoints as CPU state dicts."""
+    for _, source_row in source_relevance_df.iterrows():
+        row = dict(source_row)
+        row.update({
+            "candidate_name": source_row["dataset_name"],
+            "is_pretrained": False,
+        })
+        rows.append(row)
+
+    representatives_df = pd.DataFrame(rows)
+    num_candidates = min(H, len(representatives_df))
+
+    selected_candidates_df = (
+        representatives_df
+        .sort_values("best_loss", ascending=True)
+        .head(num_candidates)
+        .reset_index(drop=True)
+    )
+
+    return representatives_df, selected_candidates_df
+
+
+# ============================================================
+# CANDIDATE STATE DICTS
+# ============================================================
+
+def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, device, bank_repo_id=None, pretrained_subfolder=None):
+    """Load only selected candidates as CPU state dictionaries."""
     candidates = {}
 
-    theta_0 = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
-    candidates["theta_0"] = {k: v.detach().clone() for k, v in theta_0.state_dict().items()}
-    del theta_0
+    for _, row in selected_candidates_df.iterrows():
+        if bool(row["is_pretrained"]):
+            model = load_pretrained_checkpoint(
+                pretrained_model_name=pretrained_model_name,
+                pretrained_subfolder=pretrained_subfolder,
+                bank_repo_id=bank_repo_id,
+            )
+            candidate_name = "theta_0"
+        else:
+            model = load_bank_checkpoint(row, bank_repo_id)
+            candidate_name = row["dataset_name"]
 
-    for _, row in top_sources_df.iterrows():
-        model = load_bank_checkpoint(row, bank_repo_id)
-        candidates[row["dataset_name"]] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        candidates[candidate_name] = {
+            k: v.detach().cpu().clone()
+            for k, v in model.state_dict().items()
+        }
+
         del model
 
     return candidates
 
 
-# ------------------------------------------------------------------
-# Step 5: differentiable interpolation + EG optimization
-# ------------------------------------------------------------------
+# ============================================================
+# DIFFERENTIABLE INTERPOLATION
+# ============================================================
 
 def interpolate_state_dicts(candidate_state_dicts, weights, device):
     """theta(w) = sum_k w_k theta_k, differentiable with respect to weights."""
     names = list(candidate_state_dicts.keys())
     param_keys = candidate_state_dicts[names[0]].keys()
-
     interpolated = {}
 
     for key in param_keys:
-        stacked = torch.stack([candidate_state_dicts[name][key].to(device) for name in names], dim=0)
+        stacked = torch.stack(
+            [candidate_state_dicts[name][key].to(device) for name in names],
+            dim=0,
+        )
+
         w = weights.view(-1, *([1] * (stacked.dim() - 1)))
         interpolated[key] = (w * stacked).sum(dim=0)
 
@@ -164,7 +219,7 @@ def interpolate_state_dicts(candidate_state_dicts, weights, device):
 
 
 def batch_loss_at_weights(model_template, candidate_state_dicts, weights, batch, device):
-    """Forward pass of theta(w) on batch B."""
+    """Forward pass of theta(w) on incoming batch B."""
     params = interpolate_state_dicts(candidate_state_dicts, weights, device)
     outputs = functional_call(model_template, params, args=(), kwargs=batch, tie_weights=False)
     return outputs.loss
@@ -177,9 +232,14 @@ def exponentiated_gradient_step(weights, grad, lr):
         return scaled / scaled.sum()
 
 
+# ============================================================
+# WEIGHT OPTIMIZATION
+# ============================================================
+
 def optimize_weights(model_template, candidate_state_dicts, batch, device, init_weights, num_iters, lr):
-    """Run EG from one starting point and record the full optimization trajectory."""
+    """Run exponentiated gradient from one initialization."""
     weights = init_weights.clone().to(device)
+
     best_weights = None
     best_loss = float("inf")
     best_iteration = None
@@ -188,11 +248,11 @@ def optimize_weights(model_template, candidate_state_dicts, batch, device, init_
     for iteration in range(num_iters):
         weights = weights.detach().requires_grad_(True)
         loss = batch_loss_at_weights(model_template, candidate_state_dicts, weights, batch, device)
-        current_loss = loss.item()
+        current_loss = float(loss.item())
 
         trajectory.append({
             "iteration": iteration,
-            "loss": float(current_loss),
+            "loss": current_loss,
             "weights": weights.detach().cpu().tolist(),
         })
 
@@ -205,13 +265,20 @@ def optimize_weights(model_template, candidate_state_dicts, batch, device, init_
         grad = weights.grad.detach()
         weights = exponentiated_gradient_step(weights.detach(), grad, lr)
 
-    # Evaluate the last point produced by the final EG update.
     with torch.no_grad():
-        final_loss = batch_loss_at_weights(model_template, candidate_state_dicts, weights, batch, device).item()
+        final_loss = float(
+            batch_loss_at_weights(
+                model_template,
+                candidate_state_dicts,
+                weights,
+                batch,
+                device,
+            ).item()
+        )
 
     trajectory.append({
         "iteration": num_iters,
-        "loss": float(final_loss),
+        "loss": final_loss,
         "weights": weights.detach().cpu().tolist(),
     })
 
@@ -224,35 +291,53 @@ def optimize_weights(model_template, candidate_state_dicts, batch, device, init_
 
 
 def multi_start_optimize(model_template, candidate_state_dicts, batch, device, config):
-    """Run EG from multiple starts, compare with vertices and retain all trajectories."""
+    """Run EG from multiple starts and compare against every simplex vertex."""
     names = list(candidate_state_dicts.keys())
     K = len(names)
 
     with torch.no_grad():
         vertex_losses = []
+
         for i in range(K):
-            v = torch.zeros(K, device=device)
-            v[i] = 1.0
-            loss = batch_loss_at_weights(model_template, candidate_state_dicts, v, batch, device).item()
-            vertex_losses.append(loss)
+            vertex = torch.zeros(K, device=device)
+            vertex[i] = 1.0
 
-    starts = []
-    start_names = []
+            loss = batch_loss_at_weights(
+                model_template,
+                candidate_state_dicts,
+                vertex,
+                batch,
+                device,
+            ).item()
 
-    starts.append(torch.full((K,), 1.0 / K))
-    start_names.append("uniform")
+            vertex_losses.append(float(loss))
+
+    starts = [torch.full((K,), 1.0 / K)]
+    start_names = ["uniform"]
 
     flat_tau = config.get("flat_tau", DEFAULT_CONFIG["flat_tau"])
-    starts.append(F.softmax(-torch.tensor(vertex_losses) / flat_tau, dim=0))
+    starts.append(
+        F.softmax(
+            -torch.tensor(vertex_losses, dtype=torch.float32) / flat_tau,
+            dim=0,
+        )
+    )
     start_names.append("flat_soft")
 
     R = config.get("num_random_starts", DEFAULT_CONFIG["num_random_starts"])
-    concentration = config.get("dirichlet_concentration", DEFAULT_CONFIG["dirichlet_concentration"])
+    concentration = config.get(
+        "dirichlet_concentration",
+        DEFAULT_CONFIG["dirichlet_concentration"],
+    )
     seed = config.get("seed", DEFAULT_CONFIG["seed"])
-    dirichlet = torch.distributions.Dirichlet(torch.full((K,), concentration))
+
+    dirichlet = torch.distributions.Dirichlet(
+        torch.full((K,), concentration)
+    )
 
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
+
         for random_id in range(R):
             starts.append(dirichlet.sample())
             start_names.append(f"random_{random_id + 1}")
@@ -265,7 +350,6 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
     best_start_id = None
     best_start_name = None
     best_iteration = None
-
     all_trajectories = []
 
     for start_id, (start_name, start) in enumerate(zip(start_names, starts)):
@@ -297,10 +381,10 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
 
     for i, vertex_loss in enumerate(vertex_losses):
         if vertex_loss < best_loss:
-            v = torch.zeros(K, device=device)
-            v[i] = 1.0
+            vertex = torch.zeros(K, device=device)
+            vertex[i] = 1.0
 
-            best_weights = v
+            best_weights = vertex
             best_loss = vertex_loss
             best_start_id = None
             best_start_name = None
@@ -321,25 +405,31 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
     }
 
 
-# ------------------------------------------------------------------
-# Step 6: compose theta_B
-# ------------------------------------------------------------------
+# ============================================================
+# MODEL COMPOSITION
+# ============================================================
 
 def compose_model(model_template, candidate_state_dicts, weights, device):
-    """Materialize theta_B = sum_k w*_k theta_k as an actual model."""
+    """Materialize theta_B = sum_k w*_k theta_k."""
     with torch.no_grad():
-        params = interpolate_state_dicts(candidate_state_dicts, weights, device)
+        params = interpolate_state_dicts(
+            candidate_state_dicts,
+            weights,
+            device,
+        )
 
     model = copy.deepcopy(model_template).to(device)
     model.load_state_dict(params)
+    model.eval()
+
     return model
 
 
-# ------------------------------------------------------------------
-# Top-level entry point
-# ------------------------------------------------------------------
+# ============================================================
+# HIERARCHICAL ROUTING
+# ============================================================
 
-def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_name, device, config=None, bank_repo_id=None, bank_df=None, scored_bank_df=None):
+def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_name, device, config=None, bank_repo_id=None, bank_df=None, scored_bank_df=None, pretrained_loss=None, pretrained_subfolder=None):
     """Run Hierarchical Routing and return theta_B plus routing information."""
     config = {**DEFAULT_CONFIG, **(config or {})}
     batch = move_batch_to_device(batch, device)
@@ -349,32 +439,82 @@ def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_n
         bank_df = filter_trained_rows(bank_df)
 
     if scored_bank_df is None:
-        scored_bank_df = compute_bank_batch_losses(bank_df, batch, device, bank_repo_id)
+        raise ValueError(
+            "Hierarchical Routing requires the precomputed losses of all "
+            "bank checkpoints through scored_bank_df."
+        )
+
+    if pretrained_loss is None:
+        raise ValueError(
+            "Hierarchical Routing requires the precomputed theta_0 batch "
+            "loss through pretrained_loss."
+        )
 
     source_relevance_df = compute_source_relevance(scored_bank_df)
-    top_sources_df = select_top_h_sources(source_relevance_df, config["H"])
 
-    candidate_state_dicts = build_candidate_state_dicts(top_sources_df, pretrained_model_name, device, bank_repo_id)
+    representatives_df, selected_candidates_df = select_routing_candidates(
+        source_relevance_df,
+        pretrained_loss,
+        config["H"],
+    )
 
-    model_template = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
-    model_template.eval()
+    candidate_state_dicts = build_candidate_state_dicts(
+        selected_candidates_df=selected_candidates_df,
+        pretrained_model_name=pretrained_model_name,
+        device=device,
+        bank_repo_id=bank_repo_id,
+        pretrained_subfolder=pretrained_subfolder,
+    )
 
-    optimization_info = multi_start_optimize(model_template, candidate_state_dicts, batch, device, config)
+    model_template = load_pretrained_checkpoint(
+        pretrained_model_name=pretrained_model_name,
+        device=device,
+        pretrained_subfolder=pretrained_subfolder,
+        bank_repo_id=bank_repo_id,
+    )
+
+    optimization_info = multi_start_optimize(
+        model_template,
+        candidate_state_dicts,
+        batch,
+        device,
+        config,
+    )
 
     best_weights = optimization_info["best_weights"]
-    theta_B = compose_model(model_template, candidate_state_dicts, best_weights, device)
+
+    theta_B = compose_model(
+        model_template,
+        candidate_state_dicts,
+        best_weights,
+        device,
+    )
 
     names = list(candidate_state_dicts.keys())
 
+    selected_ft_df = selected_candidates_df[
+        selected_candidates_df["is_pretrained"] == False
+    ]
+
     info = {
         "candidate_names": names,
-        "weights": dict(zip(names, best_weights.detach().cpu().tolist())),
-        "batch_loss": optimization_info["best_loss"],
+        "weights": dict(
+            zip(
+                names,
+                best_weights.detach().cpu().tolist(),
+            )
+        ),
+        "batch_loss": float(optimization_info["best_loss"]),
         "vertex_losses": optimization_info["vertex_losses"],
+        "pretrained_loss": float(pretrained_loss),
         "source_relevance": source_relevance_df.to_dict(orient="records"),
-        "selected_sources": top_sources_df["dataset_name"].tolist(),
-        "selected_lambdas": {row["dataset_name"]: float(row["lambda_star"]) for _, row in top_sources_df.iterrows()},
-        "selected_candidates": top_sources_df.to_dict(orient="records"),
+        "representatives": representatives_df.to_dict(orient="records"),
+        "selected_sources": selected_ft_df["dataset_name"].tolist(),
+        "selected_lambdas": {
+            row["dataset_name"]: float(row["lambda_star"])
+            for _, row in selected_ft_df.iterrows()
+        },
+        "selected_candidates": selected_candidates_df.to_dict(orient="records"),
         "best_start_id": optimization_info["best_start_id"],
         "best_start_name": optimization_info["best_start_name"],
         "best_iteration": optimization_info["best_iteration"],
@@ -399,8 +539,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-bank-metadata", required=True)
     parser.add_argument("--pretrained-model-name", default="gpt2-medium")
+    parser.add_argument("--bank-repo-id", default=None)
+    parser.add_argument("--pretrained-subfolder", default=None)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
-    print("This module exposes run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_name, device, config).")
+    print(
+        "This module exposes run_hierarchical_routing("
+        "model_bank_metadata_path, batch, pretrained_model_name, "
+        "device, config, ...)."
+    )
