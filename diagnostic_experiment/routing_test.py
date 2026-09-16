@@ -837,10 +837,23 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
     all_wide, all_long = [], []
 
     for dataset_name in EXPERIMENT_CONFIG["deployments"]:
-        print(f"\n\n################ PRIMARY EPISODIC: {dataset_name} ################", flush=True)
-        batches, stats = load_deployment_batches(dataset_name, tokenizer, num_batches, offset, EXPERIMENT_CONFIG, DATASET_REGISTRY)
         dataset_dir = os.path.join(out, safe_name(dataset_name))
         os.makedirs(dataset_dir, exist_ok=True)
+
+        dataset_wide_path = os.path.join(dataset_dir, "all_batches_results.csv")
+        dataset_long_path = os.path.join(dataset_dir, "all_method_results.csv")
+        dataset_summary_path = os.path.join(dataset_dir, "summary_results.csv")
+
+        if (os.path.exists(dataset_wide_path) and os.path.exists(dataset_long_path) and os.path.exists(dataset_summary_path)):
+            print(f"\nSkipping completed dataset: {dataset_name}", flush=True)
+            existing_wide = pd.read_csv(dataset_wide_path)
+            existing_long = pd.read_csv(dataset_long_path)
+            all_wide.extend(existing_wide.to_dict("records"))
+            all_long.extend(existing_long.to_dict("records"))
+            continue
+
+        print(f"\n\n################ PRIMARY EPISODIC: {dataset_name} ################", flush=True)
+        batches, stats = load_deployment_batches(dataset_name, tokenizer, num_batches, offset, EXPERIMENT_CONFIG, DATASET_REGISTRY)
         save_json(os.path.join(dataset_dir, "dataset_stats.json"), stats)
 
         best_single, best_single_time = None, 0.0

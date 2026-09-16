@@ -210,17 +210,24 @@ def load_translation_dataset(config):
 
     lang = config["dataset"].get("language", "en")
 
-    if config["dataset"].get("streaming", False):
-        dataset_size = config["training"].get("dataset_size")
-        dataset = dataset.take(dataset_size)
-        dataset = Dataset.from_list(list(dataset))
-
     def extract_language(example):
         example["text"] = example["translation"][lang]
         return example
 
     dataset = dataset.map(extract_language)
     dataset = dataset.filter(lambda x: len(x["text"].strip()) > 5)
+
+    dataset_offset = int(config["training"].get("dataset_offset", 0))
+
+    if dataset_offset < 0:
+        raise ValueError("dataset_offset must be >= 0.")
+
+    if dataset_offset > 0:
+        if config["dataset"].get("streaming", False):
+            dataset = dataset.skip(dataset_offset)
+        else:
+            start = min(dataset_offset, len(dataset))
+            dataset = dataset.select(range(start, len(dataset)))
 
     return dataset
 

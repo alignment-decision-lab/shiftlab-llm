@@ -589,8 +589,8 @@ EXPERIMENT_4_CONFIG = {
         "GitHub",
         "OWT2",
         "PubMed Abstracts",
-        "StackExchange",
-        "Wikipedia",
+        #"StackExchange",
+        #"Wikipedia",
     ],
 
     "context_length": 512,
