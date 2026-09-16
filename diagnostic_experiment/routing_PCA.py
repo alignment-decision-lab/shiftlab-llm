@@ -17,10 +17,10 @@ from PCA import augment_gram_with_pretrained
 ANALYSIS_DIR = "outputs/routing_PCA"
 GRID_STEP = 0.05
 
-FONT_SIZE_AXES = 22
-FONT_SIZE_TICKS = 18
-FONT_SIZE_LEGEND = 19
-FONT_SIZE_ANNOTATION = 17
+FONT_SIZE_AXES = 30
+FONT_SIZE_TICKS = 25
+FONT_SIZE_LEGEND = 25
+FONT_SIZE_ANNOTATION = 24
 
 EDGE_LINEWIDTH = 2.2
 TRAJECTORY_LINEWIDTH = 2.6
@@ -498,7 +498,7 @@ def plot_routing_pca_2d(
     )
 
     fig, ax = plt.subplots(
-        figsize=(15, 10.5)
+        figsize=(16, 11)
     )
 
     plot_candidate_edges(
@@ -621,7 +621,7 @@ def plot_loss_trajectory(
     )
 
     fig, ax = plt.subplots(
-        figsize=(11.5, 7.0)
+        figsize=(14, 8.5)
     )
 
     color_map = get_trajectory_colors(
@@ -1194,7 +1194,7 @@ def plot_pca_loss_landscape(
 
     # Slightly wider figure so the legend, candidate labels and colorbar
     # all have enough horizontal room.
-    fig, ax = plt.subplots(figsize=(18.5, 11.5))
+    fig, ax = plt.subplots(figsize=(20, 13))
     cmap = make_light_colormap()
 
     # H=3: true triangular 2D simplex -> contour heatmap.
@@ -1296,7 +1296,7 @@ def plot_pca_loss_landscape(
             f"Hierarchical optimum loss: {grid_summary['eg_best_loss']:.4f} | "
             f"Grid-search optimum loss: {grid_summary['grid_best_loss']:.4f}"
         ),
-        fontsize=FONT_SIZE_LEGEND,
+        fontsize=28,
         pad=16,
     )
 

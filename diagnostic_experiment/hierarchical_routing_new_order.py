@@ -1,22 +1,25 @@
-"""Hierarchical Routing: the paper's deployment-time routing strategy.
+"""Hierarchical Routing with source-first ERM screening.
 
 Given an incoming unlabeled batch B and a model bank
 M = {theta_0} U {theta_{j,lambda}}:
 
-1. Use the precomputed batch losses of every bank checkpoint and theta_0.
-2. For each source j:
-       lambda*_j(B) = argmin_lambda L_hat_B(theta_{j,lambda})
-       alpha_j(B) = -min_lambda L_hat_B(theta_{j,lambda})
-3. Consider theta_0 together with the best checkpoint of every source and
-   keep the H representatives with the smallest batch loss.
-4. Optimize interpolation weights w over the simplex Delta(C_B) via
-   exponentiated-gradient descent, from several starting points, and
-   compare against every simplex vertex.
-5. Compose:
+1. Score theta_0 and the standard ERM checkpoint theta_{j,0} of every source.
+2. Keep the H candidates with the smallest incoming-batch loss among:
+       {theta_0} U {theta_{j,0}}.
+3. For each selected fine-tuned source j, score all its lambda checkpoints:
+       lambda*_j(B) = argmin_lambda L_hat_B(theta_{j,lambda}).
+   If theta_0 was selected at Step 2, it remains unchanged.
+4. Build C_B from theta_0 when selected and the lambda*_j(B) checkpoint of
+   every selected source.
+5. Optimize interpolation weights w over the simplex Delta(C_B) via
+   exponentiated-gradient descent, from several starting points, and compare
+   against every simplex vertex.
+6. Compose:
        theta_B = sum_k w*_k theta_k.
 
-The routing batch is unchanged. During EG optimization only, its gradient
-is accumulated over micro-batches to reduce peak GPU memory.
+Relative to hierarchical_routing.py, only the candidate-selection order changes.
+The routing batch is unchanged; EG gradients are accumulated over micro-batches
+only to reduce peak GPU memory.
 """
 
 import copy
@@ -81,11 +84,33 @@ def filter_trained_rows(bank_df):
 
 
 # ============================================================
-# BANK SCORING
+# ERM SCREENING
 # ============================================================
 
-def compute_bank_batch_losses(bank_df, batch, device, bank_repo_id=None):
-    """Compute L_hat_B(theta_{j,lambda}) for every bank checkpoint."""
+def select_erm_representatives(bank_df):
+    """Select the lambda=0.0 ERM checkpoint of every source."""
+    rows = []
+
+    for dataset_name, group in bank_df.groupby("dataset_name"):
+        lambdas = pd.to_numeric(group["lambda"], errors="coerce")
+        matches = group[lambdas.abs() < 1e-12]
+
+        if matches.empty:
+            available = sorted(lambdas.dropna().unique().tolist())
+            raise ValueError(
+                f"Source {dataset_name!r} has no lambda=0.0 ERM checkpoint. "
+                f"Available lambdas: {available}"
+            )
+
+        row = dict(matches.iloc[0])
+        row["dataset_name"] = dataset_name
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_checkpoint_batch_losses(bank_df, batch, device, bank_repo_id=None):
+    """Compute incoming-batch loss for exactly the checkpoints in bank_df."""
     losses = []
 
     for _, row in bank_df.iterrows():
@@ -106,12 +131,68 @@ def compute_bank_batch_losses(bank_df, batch, device, bank_repo_id=None):
     return scored_df
 
 
+def select_top_h_erm_candidates(scored_erm_df, pretrained_loss, H):
+    """Keep Top-H among theta_0 and the lambda=0.0 ERM model of every source."""
+    rows = [{
+        "candidate_name": "theta_0",
+        "dataset_name": "theta_0",
+        "lambda": None,
+        "batch_loss": float(pretrained_loss),
+        "is_pretrained": True,
+    }]
+
+    for _, source_row in scored_erm_df.iterrows():
+        row = dict(source_row)
+        row.update({"candidate_name": source_row["dataset_name"], "is_pretrained": False})
+        rows.append(row)
+
+    screening_candidates_df = pd.DataFrame(rows)
+    num_candidates = min(H, len(screening_candidates_df))
+    selected_screening_df = screening_candidates_df.sort_values(
+        "batch_loss"
+    ).head(num_candidates).reset_index(drop=True)
+
+    return screening_candidates_df, selected_screening_df
+
+
 # ============================================================
-# SOURCE RELEVANCE AND CANDIDATE SELECTION
+# SELECTED-SOURCE LAMBDA SCORING
 # ============================================================
 
+def score_selected_source_banks(bank_df, selected_sources, scored_erm_df, batch, device, bank_repo_id=None):
+    """Score all lambdas only for selected sources, reusing their ERM losses."""
+    selected_bank_df = bank_df[bank_df["dataset_name"].isin(selected_sources)].copy()
+    erm_losses = {
+        row["dataset_name"]: float(row["batch_loss"])
+        for _, row in scored_erm_df.iterrows()
+    }
+    losses = []
+
+    for _, row in selected_bank_df.iterrows():
+        dataset_name, lambda_value = row["dataset_name"], float(row["lambda"])
+
+        if abs(lambda_value) < 1e-12:
+            losses.append(erm_losses[dataset_name])
+            continue
+
+        model = load_bank_checkpoint(row, bank_repo_id).to(device)
+        model.eval()
+
+        with torch.no_grad():
+            loss = model(**batch, use_cache=False).loss.item()
+
+        losses.append(float(loss))
+        del model
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    selected_bank_df["batch_loss"] = losses
+    return selected_bank_df.reset_index(drop=True)
+
+
 def compute_source_relevance(scored_bank_df):
-    """Find lambda*_j(B), best loss and alpha_j(B) for each source."""
+    """Find lambda*_j(B), best loss and alpha_j(B) for each selected source."""
     rows = []
 
     for dataset_name, group in scored_bank_df.groupby("dataset_name"):
@@ -130,35 +211,33 @@ def compute_source_relevance(scored_bank_df):
     return pd.DataFrame(rows)
 
 
-def select_top_h_sources(source_relevance_df, H):
-    """Keep the H source families with the largest alpha_j(B)."""
-    H = min(H, len(source_relevance_df))
-    return source_relevance_df.sort_values("alpha", ascending=False).head(H).reset_index(drop=True)
+def build_final_candidates(selected_screening_df, source_relevance_df, pretrained_loss):
+    """Replace each selected ERM representative by its source-optimal lambda*_j."""
+    rows = []
 
+    for _, selected_row in selected_screening_df.iterrows():
+        if bool(selected_row["is_pretrained"]):
+            rows.append({
+                "candidate_name": "theta_0",
+                "dataset_name": "theta_0",
+                "lambda_star": None,
+                "best_loss": float(pretrained_loss),
+                "alpha": -float(pretrained_loss),
+                "is_pretrained": True,
+            })
+            continue
 
-def select_routing_candidates(source_relevance_df, pretrained_loss, H):
-    """Compete theta_0 against each source representative and keep H candidates total."""
-    rows = [{
-        "candidate_name": "theta_0",
-        "dataset_name": "theta_0",
-        "lambda_star": None,
-        "best_loss": float(pretrained_loss),
-        "alpha": -float(pretrained_loss),
-        "is_pretrained": True,
-    }]
+        dataset_name = selected_row["dataset_name"]
+        source_row = source_relevance_df[source_relevance_df["dataset_name"] == dataset_name]
 
-    for _, source_row in source_relevance_df.iterrows():
-        row = dict(source_row)
-        row.update({"candidate_name": source_row["dataset_name"], "is_pretrained": False})
+        if source_row.empty:
+            raise ValueError(f"No lambda scoring result found for selected source {dataset_name!r}.")
+
+        row = dict(source_row.iloc[0])
+        row.update({"candidate_name": dataset_name, "is_pretrained": False})
         rows.append(row)
 
-    representatives_df = pd.DataFrame(rows)
-    num_candidates = min(H, len(representatives_df))
-    selected_candidates_df = representatives_df.sort_values(
-        "best_loss", ascending=True
-    ).head(num_candidates).reset_index(drop=True)
-
-    return representatives_df, selected_candidates_df
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 # ============================================================
@@ -166,7 +245,7 @@ def select_routing_candidates(source_relevance_df, pretrained_loss, H):
 # ============================================================
 
 def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, device, bank_repo_id=None, pretrained_subfolder=None):
-    """Load only selected candidates as CPU state dictionaries."""
+    """Load only final selected candidates as CPU state dictionaries."""
     candidates = {}
 
     for _, row in selected_candidates_df.iterrows():
@@ -413,11 +492,11 @@ def compose_model(model_template, candidate_state_dicts, weights, device):
 
 
 # ============================================================
-# HIERARCHICAL ROUTING
+# HIERARCHICAL ROUTING — NEW ORDER
 # ============================================================
 
-def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_name, device, config=None, bank_repo_id=None, bank_df=None, scored_bank_df=None, pretrained_loss=None, pretrained_subfolder=None):
-    """Run Hierarchical Routing and return theta_B plus routing information."""
+def run_hierarchical_routing_new_order(model_bank_metadata_path, batch, pretrained_model_name, device, config=None, bank_repo_id=None, bank_df=None, pretrained_loss=None, pretrained_subfolder=None):
+    """Run ERM-screened Hierarchical Routing and return theta_B plus routing information."""
     config = {**DEFAULT_CONFIG, **(config or {})}
     batch = move_batch_to_device(batch, device)
 
@@ -425,21 +504,38 @@ def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_n
         bank_df = load_model_bank_metadata(model_bank_metadata_path)
         bank_df = filter_trained_rows(bank_df)
 
-    if scored_bank_df is None:
-        raise ValueError(
-            "Hierarchical Routing requires the precomputed losses of all "
-            "bank checkpoints through scored_bank_df."
-        )
-
     if pretrained_loss is None:
         raise ValueError(
-            "Hierarchical Routing requires the precomputed theta_0 batch "
-            "loss through pretrained_loss."
+            "New-order Hierarchical Routing requires the precomputed "
+            "theta_0 batch loss through pretrained_loss."
         )
 
-    source_relevance_df = compute_source_relevance(scored_bank_df)
-    representatives_df, selected_candidates_df = select_routing_candidates(
-        source_relevance_df, pretrained_loss, config["H"]
+    # Step 1: score theta_{j,0} for every source; theta_0 is already scored.
+    erm_df = select_erm_representatives(bank_df)
+    scored_erm_df = compute_checkpoint_batch_losses(erm_df, batch, device, bank_repo_id)
+
+    # Step 2: Top-H among theta_0 and all source ERM representatives.
+    screening_candidates_df, selected_screening_df = select_top_h_erm_candidates(
+        scored_erm_df, pretrained_loss, config["H"]
+    )
+
+    selected_sources = selected_screening_df.loc[
+        selected_screening_df["is_pretrained"] == False, "dataset_name"
+    ].tolist()
+
+    # Step 3: score every lambda only for fine-tuned sources surviving Top-H.
+    if selected_sources:
+        scored_selected_bank_df = score_selected_source_banks(
+            bank_df, selected_sources, scored_erm_df, batch, device, bank_repo_id
+        )
+        source_relevance_df = compute_source_relevance(scored_selected_bank_df)
+    else:
+        scored_selected_bank_df = pd.DataFrame()
+        source_relevance_df = pd.DataFrame()
+
+    # Step 4: replace selected ERM representatives by their lambda*_j checkpoints.
+    selected_candidates_df = build_final_candidates(
+        selected_screening_df, source_relevance_df, pretrained_loss
     )
 
     candidate_state_dicts = build_candidate_state_dicts(
@@ -458,6 +554,7 @@ def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_n
     )
     model_template.config.use_cache = False
 
+    # Step 5: same simplex optimization as current-order Hierarchical Routing.
     optimization_info = multi_start_optimize(
         model_template, candidate_state_dicts, batch, device, config
     )
@@ -474,13 +571,19 @@ def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_n
         "batch_loss": float(optimization_info["best_loss"]),
         "vertex_losses": optimization_info["vertex_losses"],
         "pretrained_loss": float(pretrained_loss),
-        "source_relevance": source_relevance_df.to_dict(orient="records"),
-        "representatives": representatives_df.to_dict(orient="records"),
+        "screening_lambda": 0.0,
+        "screening_candidates": screening_candidates_df.to_dict(orient="records"),
+        "screening_losses": {
+            row["candidate_name"]: float(row["batch_loss"])
+            for _, row in screening_candidates_df.iterrows()
+        },
+        "screening_top_h": selected_screening_df["candidate_name"].tolist(),
         "selected_sources": selected_ft_df["dataset_name"].tolist(),
         "selected_lambdas": {
             row["dataset_name"]: float(row["lambda_star"])
             for _, row in selected_ft_df.iterrows()
         },
+        "source_relevance": source_relevance_df.to_dict(orient="records"),
         "selected_candidates": selected_candidates_df.to_dict(orient="records"),
         "best_start_id": optimization_info["best_start_id"],
         "best_start_name": optimization_info["best_start_name"],
@@ -505,7 +608,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-bank-metadata", required=True)
-    parser.add_argument("--pretrained-model-name", default="gpt2-medium")
+    parser.add_argument("--pretrained-model-name", default="gpt2")
     parser.add_argument("--bank-repo-id", default=None)
     parser.add_argument("--pretrained-subfolder", default=None)
     args = parser.parse_args()
@@ -513,6 +616,6 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(
-        "This module exposes run_hierarchical_routing("
+        "This module exposes run_hierarchical_routing_new_order("
         "model_bank_metadata_path, batch, pretrained_model_name, device, config, ...)."
     )
