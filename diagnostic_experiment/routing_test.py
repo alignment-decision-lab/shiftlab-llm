@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForLan
 
 import utils
 import hierarchical_routing as hr
+import hierarchical_routing_new_order as hr_new
 import routing_baselines as rb
 import routing_PCA as rpca
 import online_tent as ot
@@ -25,11 +26,13 @@ OUTPUT_ROOT = "outputs/experimental_pipeline"
 
 PRIMARY_METHODS = [
     "pretrained", "best_single_ft", "mixed_ft", "static_tent_best_single", "tent_best_single",
-    "hard", "flat", "static_hierarchical", "hierarchical", "tent_hierarchical", "oracle",
+    "hard", "flat", "static_hierarchical", "hierarchical", "tent_hierarchical",
+    "static_new_order_hierarchical", "new_order_hierarchical", "tent_new_order_hierarchical", "oracle",
 ]
 NONSTATIONARY_METHODS = [
     "pretrained", "best_single_ft", "mixed_ft", "static_tent_best_single", "tent_best_single",
     "hard", "flat", "static_hierarchical", "hierarchical", "tent_hierarchical",
+    "static_new_order_hierarchical", "new_order_hierarchical", "tent_new_order_hierarchical",
 ]
 METHOD_LABELS = {
     "pretrained": "Pretrained",
@@ -39,9 +42,12 @@ METHOD_LABELS = {
     "tent_best_single": "TENT (Best Single-FT)",
     "hard": "Hard Routing",
     "flat": "Flat Routing",
-    "static_hierarchical": "Static Hierarchical Routing",
-    "hierarchical": "Hierarchical Routing",
-    "tent_hierarchical": "TENT (Hierarchical Routing)",
+    "static_hierarchical": "Static Hierarchical Routing (Current Order)",
+    "hierarchical": "Hierarchical Routing (Current Order)",
+    "tent_hierarchical": "TENT (Hierarchical Routing, Current Order)",
+    "static_new_order_hierarchical": "Static Hierarchical Routing (New Order)",
+    "new_order_hierarchical": "Hierarchical Routing (New Order)",
+    "tent_new_order_hierarchical": "TENT (Hierarchical Routing, New Order)",
     "oracle": "Target-FT Oracle",
 }
 
@@ -68,7 +74,7 @@ def get_bank_prefix(EXPERIMENT_CONFIG, MODEL_REGISTRY):
 def get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=False):
     cfg = dict(EXPERIMENT_CONFIG["hierarchical"])
     if for_tent:
-        cfg["num_iters"] = EXPERIMENT_CONFIG.get("tent_hierarchical", {}).get("num_iters", cfg["num_iters"])
+        cfg["num_iters"] = EXPERIMENT_CONFIG.get("tent_hierarchical", {}).get("num_iters", 5)
     return cfg
 
 
@@ -193,6 +199,9 @@ def validate_config(EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
         raise ValueError("At least one source dataset is required.")
     if not EXPERIMENT_CONFIG.get("deployments"):
         raise ValueError("At least one deployment dataset is required.")
+    for key in ["sources", "deployments"]:
+        if len(EXPERIMENT_CONFIG[key]) != len(set(EXPERIMENT_CONFIG[key])):
+            raise ValueError(f"{key} must contain unique datasets.")
     for name in EXPERIMENT_CONFIG["sources"] + EXPERIMENT_CONFIG["deployments"]:
         if name not in DATASET_REGISTRY:
             raise ValueError(f"Dataset '{name}' is not in DATASET_REGISTRY.")
@@ -214,16 +223,20 @@ def validate_config(EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
         if not cfg.get("enabled", False):
             continue
         methods = get_protocol_methods(EXPERIMENT_CONFIG, protocol)
+        if not methods or len(methods) != len(set(methods)):
+            raise ValueError(f"{protocol}.methods must be nonempty and contain no duplicates.")
         unknown = set(methods) - valid
         if unknown:
             raise ValueError(f"Unknown methods in {protocol}: {sorted(unknown)}")
         n = cfg.get("num_batches") if protocol == "primary_episodic" else cfg.get("num_online_batches")
-        if n is None or int(n) <= 0:
-            raise ValueError(f"{protocol} requires a positive number of batches.")
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+            raise ValueError(f"{protocol} requires a positive integer number of batches.")
         offset = int(cfg.get("deployment_offset_tokens", 512_000 if protocol == "primary_episodic" else 0))
         if offset % EXPERIMENT_CONFIG["context_length"] != 0:
             raise ValueError(f"{protocol}.deployment_offset_tokens must be divisible by context_length.")
         if protocol == "nonstationary_stream":
+            if n % len(EXPERIMENT_CONFIG["deployments"]):
+                raise ValueError("nonstationary_stream.num_online_batches must be divisible by the number of deployment datasets.")
             overlap = set(EXPERIMENT_CONFIG["sources"]) & set(EXPERIMENT_CONFIG["deployments"])
             if overlap:
                 raise ValueError(
@@ -231,7 +244,7 @@ def validate_config(EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
                     f"Overlap found: {sorted(overlap)}"
                 )
             if "oracle" in methods:
-                raise ValueError("Target-FT Oracle is intentionally excluded from the non-stationary protocol.")
+                raise ValueError("Target-FT Oracle is excluded from nonstationary_stream. Remove 'oracle' from this protocol's methods in experimental_pipeline.py (all four experiments); keep it in primary_episodic. No method is silently dropped.")
 
     validate_mixed_ft_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
 
@@ -335,14 +348,13 @@ def build_balanced_stream(deployments, num_online_batches, seed):
     """Balanced + random + reproducible domain sequence for the non-stationary stream."""
     if not deployments:
         raise ValueError("At least one non-stationary deployment dataset is required.")
-    base, remainder = divmod(num_online_batches, len(deployments))
+    if num_online_batches <= 0 or num_online_batches % len(deployments):
+        raise ValueError("num_online_batches must be positive and divisible by the number of deployment datasets.")
+    base = num_online_batches // len(deployments)
     sequence = []
     for name in deployments:
         sequence.extend([name] * base)
     rng = random.Random(seed)
-    extras = list(deployments)
-    rng.shuffle(extras)
-    sequence.extend(extras[:remainder])
     rng.shuffle(sequence)
     return sequence
 
@@ -492,6 +504,7 @@ def run_tent_batch(state, batch, batch_id, initialization_time, device, method_n
         "num_trainable_params": int(info["num_trainable_params"]), "num_adaptation_steps": int(info["num_adaptation_steps"]),
         "adaptation_lr": float(info["adaptation_lr"]), "state_carried": batch_id > 0,
         "num_batches_seen": int(info["num_batches_seen"]),
+        "initialization_time_sec": initialization_time if batch_id == 0 else 0.0,
     }
 
 
@@ -531,23 +544,38 @@ def run_oracle(dataset_name, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, D
 # ROUTING METHODS
 # ============================================================
 
-def compute_shared_routing_scores(bank_df, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
-    """Physically score the bank once, while charging this cost to each routing method."""
-    print("Scoring model bank once for all routing strategies...", flush=True)
+def compute_pretrained_routing_loss(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
     start = time.time()
-    batch_device = utils.move_batch_to_device(batch, device)
-    scored_bank_df = hr.compute_bank_batch_losses(bank_df=bank_df, batch=batch_device, device=device, bank_repo_id=BANK_REPO_ID)
-    model_cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
-    pretrained_loss = rb.compute_pretrained_loss(
-        pretrained_model_name=model_cfg["model_name"], pretrained_subfolder=model_cfg.get("pretrained_subfolder"),
-        batch=batch_device, device=device, bank_repo_id=BANK_REPO_ID,
+    cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
+    loss = rb.compute_pretrained_loss(
+        pretrained_model_name=cfg["model_name"], pretrained_subfolder=cfg.get("pretrained_subfolder"),
+        batch=utils.move_batch_to_device(batch, device), device=device, bank_repo_id=BANK_REPO_ID,
     )
-    scoring_time = time.time() - start
-    print(f"Shared scoring complete: {len(scored_bank_df)} bank checkpoints + theta_0 in {scoring_time:.1f}s.", flush=True)
-    return scored_bank_df, pretrained_loss, scoring_time
+    return loss, time.time() - start
 
 
-def run_hard(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
+def compute_shared_routing_scores(bank_df, batch, device):
+    """Full-bank scores are shared only by Hard, Flat and Current Order HR."""
+    start = time.time()
+    scored = hr.compute_bank_batch_losses(
+        bank_df=bank_df, batch=utils.move_batch_to_device(batch, device), device=device, bank_repo_id=BANK_REPO_ID,
+    )
+    return scored, time.time() - start
+
+
+def routing_times(pretrained_scoring_time, full_bank_scoring_time, method_time):
+    """Per-method deployment cost; shared work is charged once to each method."""
+    # New Order: method_time includes ERM -> Top-H -> selected lambdas -> EG.
+    # Current/Hard/Flat: full-bank scoring is separate. Diagnostics are excluded.
+    return {
+        "pretrained_scoring_time_sec": pretrained_scoring_time,
+        "full_bank_scoring_time_sec": full_bank_scoring_time,
+        "method_time_sec": method_time,
+        "total_time_sec": pretrained_scoring_time + full_bank_scoring_time + method_time,
+    }
+
+
+def run_hard(metadata_path, bank_df, scored_bank_df, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
     start = time.time()
     cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
     model, info = rb.run_hard_routing(
@@ -559,14 +587,13 @@ def run_hard(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_sco
     loss = float(info["batch_loss"])
     result = {
         "method": "Hard Routing", "loss": loss, "perplexity": loss_to_perplexity(loss),
-        "total_time_sec": shared_scoring_time + method_time, "method_time_sec": method_time,
-        "shared_scoring_time_sec": shared_scoring_time, "selected_candidate": info.get("selected"),
+        **routing_times(pretrained_scoring_time, full_bank_scoring_time, method_time), "selected_candidate": info.get("selected"),
     }
     clear_model(model, device)
     return result
 
 
-def run_flat(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
+def run_flat(metadata_path, bank_df, scored_bank_df, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY):
     start = time.time()
     cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
     model, info = rb.run_flat_routing(
@@ -579,29 +606,31 @@ def run_flat(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_sco
     method_time = time.time() - start
     result = {
         "method": "Flat Routing", "loss": float(loss), "perplexity": loss_to_perplexity(loss),
-        "total_time_sec": shared_scoring_time + method_time, "method_time_sec": method_time,
-        "shared_scoring_time_sec": shared_scoring_time, "num_tokens": num_tokens,
+        **routing_times(pretrained_scoring_time, full_bank_scoring_time, method_time), "num_tokens": num_tokens,
         "selected_candidates": str(info.get("candidate_names")), "weights": str(info.get("weights")),
     }
     clear_model(model, device)
     return result, info
 
 
-def build_hierarchical_model(metadata_path, bank_df, scored_bank_df, pretrained_loss, shared_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config, method_name="Hierarchical Routing"):
+def build_hierarchical_model(metadata_path, bank_df, scored_bank_df, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config, method_name="Hierarchical Routing (Current Order)", new_order=False):
     """Build a hierarchical composition and keep the returned model alive for optional static reuse."""
     start = time.time()
     cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
-    model, info = hr.run_hierarchical_routing(
+    if new_order:
+        full_bank_scoring_time = 0.0  # ERM/selected-source scoring is inside this runner.
+    runner = hr_new.run_hierarchical_routing_new_order if new_order else hr.run_hierarchical_routing
+    kwargs = {} if new_order else {"scored_bank_df": scored_bank_df}
+    model, info = runner(
         model_bank_metadata_path=metadata_path, batch=batch, pretrained_model_name=cfg["model_name"],
         pretrained_subfolder=cfg.get("pretrained_subfolder"), device=device, config=hierarchical_config,
-        bank_repo_id=BANK_REPO_ID, bank_df=bank_df, scored_bank_df=scored_bank_df, pretrained_loss=pretrained_loss,
+        bank_repo_id=BANK_REPO_ID, bank_df=bank_df, pretrained_loss=pretrained_loss, **kwargs,
     )
     method_time = time.time() - start
     loss = float(info["batch_loss"])
     result = {
         "method": method_name, "loss": loss, "perplexity": loss_to_perplexity(loss),
-        "total_time_sec": shared_scoring_time + method_time, "method_time_sec": method_time,
-        "shared_scoring_time_sec": shared_scoring_time, "selected_sources": str(info.get("selected_sources")),
+        **routing_times(pretrained_scoring_time, full_bank_scoring_time, method_time), "selected_sources": str(info.get("selected_sources")),
         "selected_lambdas": str(info.get("selected_lambdas")), "weights": str(info.get("weights")),
         "best_start": info.get("best_start_name"), "best_iteration": info.get("best_iteration"),
         "best_is_vertex": info.get("best_is_vertex"), "routing_recomputed": True,
@@ -609,13 +638,83 @@ def build_hierarchical_model(metadata_path, bank_df, scored_bank_df, pretrained_
     return model, result, info
 
 
-def evaluate_static_hierarchical(model, batch, device):
+def run_hierarchical_variants(methods, state, batch_id, metadata_path, bank_df, scored,
+                              pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device,
+                              EXPERIMENT_CONFIG, MODEL_REGISTRY, batch_dir, label):
+    results = []
+    for key in ["hierarchical", "new_order_hierarchical"]:
+        static_key, tent_key = "static_" + key, "tent_" + key
+        new_order = key == "new_order_hierarchical"
+        # Charge theta_0 to both orders, but never the full bank to New Order.
+        def build(for_tent=False):
+            return build_hierarchical_model(
+                metadata_path, bank_df, None if new_order else scored, pretrained_loss,
+                pretrained_scoring_time, 0.0 if new_order else full_bank_scoring_time,
+                batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY,
+                get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=for_tent),
+                METHOD_LABELS[tent_key if for_tent else key], new_order=new_order,
+            )
+        if key in methods or (batch_id == 0 and static_key in methods):
+            model, result, info = build()
+            try:
+                if key in methods:
+                    results.append(result)
+                if batch_id == 0 and static_key in methods:
+                    state[static_key] = model
+                    results.append({**result, "method": METHOD_LABELS[static_key]})
+                    save_hierarchical_details(batch_dir, info, static_key)
+                save_hierarchical_details(batch_dir, info, key)
+                if batch_id == 0 and not new_order and EXPERIMENT_CONFIG.get("run_pca", False):
+                    run_pca_diagnostics(info, batch_dir, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, label)
+            finally:
+                if state.get(static_key) is not model:
+                    clear_model(model, device)
+                del model
+        elif batch_id > 0 and static_key in methods:
+            if state.get(static_key) is None:
+                raise RuntimeError(f"{static_key} was not initialized on B1.")
+        if batch_id > 0 and static_key in methods:
+            results.append(evaluate_static_hierarchical(state[static_key], batch, device, METHOD_LABELS[static_key]))
+        if tent_key in methods:
+            if batch_id == 0:
+                # Independent short solve: never adapt the static/dynamic HR model.
+                model, result, info = build(for_tent=True)
+                try:
+                    state[tent_key], state[tent_key + "_time"] = init_tent_from_model(
+                        model, result["total_time_sec"], device, EXPERIMENT_CONFIG,
+                    )
+                    state[tent_key + "_scoring"] = (
+                        result["pretrained_scoring_time_sec"], result["full_bank_scoring_time_sec"],
+                    )
+                    save_hierarchical_details(batch_dir, info, tent_key)
+                finally:
+                    del model
+            result = run_tent_batch(state[tent_key], batch, batch_id, state[tent_key + "_time"], device, METHOD_LABELS[tent_key])
+            pre_time, bank_time = state[tent_key + "_scoring"] if batch_id == 0 else (0.0, 0.0)
+            # B1 total already includes the short solve and TENT initialization.
+            # initialization_time_sec is descriptive, not an extra additive cost.
+            result.update(routing_times(pre_time, bank_time, result["total_time_sec"] - pre_time - bank_time))
+            result["routing_recomputed"] = batch_id == 0
+            results.append(result)
+    return results
+
+
+def clear_hierarchical_states(state, device):
+    for key in ["hierarchical", "new_order_hierarchical"]:
+        clear_online_tent(state.pop("tent_" + key, None), device)
+        model = state.pop("static_" + key, None)
+        clear_model(model, device)
+        del model
+    state.clear()
+
+
+def evaluate_static_hierarchical(model, batch, device, method_name=METHOD_LABELS["static_hierarchical"]):
     start = time.time()
     loss, _, _, num_tokens = evaluate_batch(model, batch, device)
     total_time = time.time() - start
     return {
-        "method": "Static Hierarchical Routing", "loss": float(loss), "perplexity": loss_to_perplexity(loss),
-        "total_time_sec": total_time, "num_tokens": num_tokens, "routing_recomputed": False,
+        "method": method_name, "loss": float(loss), "perplexity": loss_to_perplexity(loss),
+        **routing_times(0.0, 0.0, total_time), "num_tokens": num_tokens, "routing_recomputed": False,
     }
 
 
@@ -642,16 +741,16 @@ def save_flat_details(batch_output_dir, info):
     pd.DataFrame(rows).to_csv(os.path.join(batch_output_dir, "flat_weights.csv"), index=False)
 
 
-def save_hierarchical_details(batch_output_dir, info):
-    if info.get("source_relevance") is not None:
-        pd.DataFrame(info["source_relevance"]).to_csv(os.path.join(batch_output_dir, "hierarchical_source_relevance.csv"), index=False)
-    if info.get("optimization_trajectories") is not None:
-        pd.DataFrame(info["optimization_trajectories"]).to_csv(os.path.join(batch_output_dir, "hierarchical_optimization_trajectories.csv"), index=False)
+def save_hierarchical_details(batch_output_dir, info, method_key="hierarchical"):
+    for key in ["screening_candidates", "source_relevance", "selected_candidates", "optimization_trajectories"]:
+        if info.get(key) is not None:
+            pd.DataFrame(info[key]).to_csv(os.path.join(batch_output_dir, f"{method_key}_{key}.csv"), index=False)
+    save_json(os.path.join(batch_output_dir, f"{method_key}_details.json"), info)
 
 
 def run_pca_diagnostics(info, batch_output_dir, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, label):
     """Preserve the original PCA + simplex/grid diagnostics, outside routing runtime."""
-    if not EXPERIMENT_CONFIG.get("run_pca", True):
+    if not EXPERIMENT_CONFIG.get("run_pca", False):
         return
     print(f"\nGenerating routing PCA for {label}...", flush=True)
     cfg = get_model_config(EXPERIMENT_CONFIG, MODEL_REGISTRY)
@@ -685,6 +784,9 @@ def build_base_row(EXPERIMENT_CONFIG, MODEL_REGISTRY, protocol, dataset, batch_i
 def save_batch_outputs(batch_output_dir, base_row, method_results, include_oracle_gap):
     os.makedirs(batch_output_dir, exist_ok=True)
     mapping = {v: k for k, v in METHOD_LABELS.items()}
+    labels = [result["method"] for result in method_results]
+    if len(mapping) != len(METHOD_LABELS) or len(labels) != len(set(labels)) or set(labels) - mapping.keys():
+        raise ValueError(f"Invalid or duplicate result labels: {labels}")
     for result in method_results:
         save_method_details(batch_output_dir, mapping[result["method"]], result)
     comparison = pd.DataFrame(method_results)
@@ -790,11 +892,16 @@ def save_method_comparison_table(output_dir):
         {"Method": "TENT (Best Single-FT)", "Deployment signal": "Current batch", "State": "Carried across batches", "Frequency": "Every batch after B1 selection"},
         {"Method": "Hard Routing", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
         {"Method": "Flat Routing", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
-        {"Method": "Static Hierarchical Routing", "Deployment signal": "First batch", "State": "Frozen after B1", "Frequency": "Once"},
-        {"Method": "Hierarchical Routing", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
-        {"Method": "TENT (Hierarchical Routing)", "Deployment signal": "B1 routing + current batch", "State": "TENT state carried after B1", "Frequency": "Hierarchical once, TENT every batch"},
+        {"Method": "Static Hierarchical Routing (Current Order)", "Deployment signal": "First batch", "State": "Frozen after B1", "Frequency": "Once"},
+        {"Method": "Hierarchical Routing (Current Order)", "Deployment signal": "Current batch", "State": "Recomputed", "Frequency": "Every batch"},
+        {"Method": "TENT (Hierarchical Routing, Current Order)", "Deployment signal": "B1 routing + current batch", "State": "TENT state carried after B1", "Frequency": "Hierarchical once, TENT every batch"},
         {"Method": "Target-FT Oracle", "Deployment signal": "Target training data", "State": "Fixed", "Frequency": "Offline; Primary only"},
     ]
+    for key in ["static_hierarchical", "hierarchical", "tent_hierarchical"]:
+        row = next(r for r in rows if r["Method"] == METHOD_LABELS[key])
+        new_key = key.replace("hierarchical", "new_order_hierarchical")
+        rows.append({**row, "Method": METHOD_LABELS[new_key]})
+    rows.sort(key=lambda row: [METHOD_LABELS[k] for k in PRIMARY_METHODS].index(row["Method"]))
     pd.DataFrame(rows).to_csv(os.path.join(output_dir, "method_comparison.csv"), index=False)
 
 
@@ -814,14 +921,15 @@ def save_method_comparison_table(output_dir):
 #   * Best Single-FT is selected once on B1. TENT (Best Single-FT) starts from
 #     that checkpoint and then adapts online; Static TENT performs only the B1
 #     update and freezes the resulting model.
+#   * Both candidate orders use the same dynamic/static/TENT protocols.
 #   * Static Hierarchical Routing is solved on B1 and frozen. Per-batch
 #     Hierarchical Routing is recomputed on every batch.
 #   * TENT (Hierarchical Routing) performs its own shorter Hierarchical Routing
 #     optimization on B1, then continues with online TENT only.
 #   * Target-FT Oracle is evaluated here, so Oracle Gap Closed is computed per
 #     batch and only then averaged.
-#   * PCA/grid diagnostics are preserved on B1 of every deployment dataset and
-#     are not counted in Hierarchical Routing runtime.
+#   * Optional PCA/grid uses only the normal/static Current Order solve on B1,
+#     outside routing runtime; never New Order or the short TENT solve.
 
 
 def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
@@ -845,12 +953,23 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
         dataset_summary_path = os.path.join(dataset_dir, "summary_results.csv")
 
         if (os.path.exists(dataset_wide_path) and os.path.exists(dataset_long_path) and os.path.exists(dataset_summary_path)):
-            print(f"\nSkipping completed dataset: {dataset_name}", flush=True)
+            print(f"\nChecking completed dataset: {dataset_name}", flush=True)
             existing_wide = pd.read_csv(dataset_wide_path)
             existing_long = pd.read_csv(dataset_long_path)
-            all_wide.extend(existing_wide.to_dict("records"))
-            all_long.extend(existing_long.to_dict("records"))
-            continue
+            expected_labels = {METHOD_LABELS[m] for m in methods}
+            if (set(existing_long["method"]) == expected_labels
+                    and (not any(m in methods for m in ["hard", "flat"] + [k for k in METHOD_LABELS if "hierarchical" in k])
+                         or {"pretrained_scoring_time_sec", "full_bank_scoring_time_sec", "method_time_sec"}.issubset(existing_long.columns))
+                    and len(existing_long) == num_batches * len(methods)
+                    and not existing_long.duplicated(["method", "batch_id"]).any()
+                    and set(existing_long["batch_id"]) == set(range(1, num_batches + 1))
+                    and set(existing_wide["batch_id"]) == set(range(1, num_batches + 1))
+                    and len(existing_wide) == num_batches
+                    and existing_long.groupby("method")["batch_id"].nunique().eq(num_batches).all()):
+                all_wide.extend(existing_wide.to_dict("records"))
+                all_long.extend(existing_long.to_dict("records"))
+                continue
+            print("Stored results do not match requested methods/batches; recomputing dataset.", flush=True)
 
         print(f"\n\n################ PRIMARY EPISODIC: {dataset_name} ################", flush=True)
         batches, stats = load_deployment_batches(dataset_name, tokenizer, num_batches, offset, EXPERIMENT_CONFIG, DATASET_REGISTRY)
@@ -862,14 +981,14 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
             best_single, best_single_time, scores = select_best_single_ft(bank_df, batches[0], device, EXPERIMENT_CONFIG)
             scores.to_csv(os.path.join(dataset_dir, "best_single_ft_selection.csv"), index=False)
 
-        static_tent_state = tent_best_state = tent_hier_state = None
-        static_tent_init_time = tent_best_init_time = tent_hier_init_time = 0.0
+        static_tent_state = tent_best_state = None
+        static_tent_init_time = tent_best_init_time = 0.0
         if "static_tent_best_single" in methods:
             static_tent_state, static_tent_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
         if "tent_best_single" in methods:
             tent_best_state, tent_best_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
 
-        static_hier_model = None
+        hier_states = {}
         dataset_wide, dataset_long = [], []
         try:
             for batch_id, batch in enumerate(batches):
@@ -900,65 +1019,28 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
                 routing_needed = any(m in methods for m in ["hard", "flat", "hierarchical"]) or (
                     batch_id == 0 and any(m in methods for m in ["static_hierarchical", "tent_hierarchical"])
                 )
-                scored = pretrained_loss = scoring_time = None
+                new_order_needed = "new_order_hierarchical" in methods or (
+                    batch_id == 0 and any(m in methods for m in ["static_new_order_hierarchical", "tent_new_order_hierarchical"])
+                )
+                scored, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time = None, None, 0.0, 0.0
+                if routing_needed or new_order_needed:
+                    pretrained_loss, pretrained_scoring_time = compute_pretrained_routing_loss(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
                 if routing_needed:
-                    scored, pretrained_loss, scoring_time = compute_shared_routing_scores(bank_df, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
+                    scored, full_bank_scoring_time = compute_shared_routing_scores(bank_df, batch, device)
                     scored.to_csv(os.path.join(batch_dir, "bank_batch_losses.csv"), index=False)
 
                 if "hard" in methods:
-                    results.append(run_hard(metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
+                    results.append(run_hard(metadata_path, bank_df, scored, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
                 if "flat" in methods:
-                    flat_result, flat_info = run_flat(metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
+                    flat_result, flat_info = run_flat(metadata_path, bank_df, scored, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
                     results.append(flat_result)
                     save_flat_details(batch_dir, flat_info)
 
-                # Normal HR remains the source for Static HR and B1 PCA/grid diagnostics.
-                hier_info = None
-                hier_b1_needed = batch_id == 0 and any(m in methods for m in ["hierarchical", "static_hierarchical", "tent_hierarchical"])
-                if hier_b1_needed:
-                    hier_model, hier_result, hier_info = build_hierarchical_model(
-                        metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                        EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
-                    )
-                    if "hierarchical" in methods:
-                        results.append(hier_result)
-                    if "tent_hierarchical" in methods:
-                        # TENT has its own B1 HR solve; only bank scores are shared.
-                        tent_hier_model, tent_hier_result, tent_hier_info = build_hierarchical_model(
-                            metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                            EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=True),
-                        )
-                        tent_hier_state, tent_hier_init_time = init_tent_from_model(
-                            tent_hier_model, tent_hier_result["total_time_sec"], device, EXPERIMENT_CONFIG,
-                        )
-                        results.append(run_tent_batch(
-                            tent_hier_state, batch, batch_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)",
-                        ))
-                    if "static_hierarchical" in methods:
-                        static_hier_model = hier_model
-                        static_result = copy.deepcopy(hier_result)
-                        static_result["method"] = "Static Hierarchical Routing"
-                        static_result["routing_recomputed"] = True
-                        results.append(static_result)
-                    else:
-                        clear_model(hier_model, device)
-                    save_hierarchical_details(batch_dir, hier_info)
-                    run_pca_diagnostics(hier_info, batch_dir, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, f"{dataset_name} - primary batch 1")
-                elif batch_id > 0:
-                    if "static_hierarchical" in methods:
-                        if static_hier_model is None:
-                            raise RuntimeError("Static Hierarchical model was not initialized on batch 1.")
-                        results.append(evaluate_static_hierarchical(static_hier_model, batch, device))
-                    if "hierarchical" in methods:
-                        hier_model, hier_result, hier_info = build_hierarchical_model(
-                            metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                            EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
-                        )
-                        results.append(hier_result)
-                        save_hierarchical_details(batch_dir, hier_info)
-                        clear_model(hier_model, device)
-                    if "tent_hierarchical" in methods:
-                        results.append(run_tent_batch(tent_hier_state, batch, batch_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)"))
+                results.extend(run_hierarchical_variants(
+                    methods, hier_states, batch_id, metadata_path, bank_df, scored, pretrained_loss,
+                    pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY,
+                    batch_dir, f"{dataset_name} - primary batch 1",
+                ))
 
                 add_oracle_gap(results)
                 base = build_base_row(EXPERIMENT_CONFIG, MODEL_REGISTRY, "primary_episodic", dataset_name, batch_id, offset)
@@ -974,14 +1056,17 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
                     pd.DataFrame(all_wide).to_csv(os.path.join(out, "all_batches_results.csv"), index=False)
                     pd.DataFrame(all_long).to_csv(os.path.join(out, "all_method_results.csv"), index=False)
 
+            pd.DataFrame(dataset_wide).to_csv(dataset_wide_path, index=False)
+            pd.DataFrame(dataset_long).to_csv(dataset_long_path, index=False)
             dataset_summary = summarize_long_results(dataset_long, include_oracle_gap=True)
             dataset_summary.to_csv(os.path.join(dataset_dir, "summary_results.csv"), index=False)
         finally:
-            clear_model(static_hier_model, device)
+            clear_hierarchical_states(hier_states, device)
             clear_online_tent(static_tent_state, device)
             clear_online_tent(tent_best_state, device)
-            clear_online_tent(tent_hier_state, device)
 
+    pd.DataFrame(all_wide).to_csv(os.path.join(out, "all_batches_results.csv"), index=False)
+    pd.DataFrame(all_long).to_csv(os.path.join(out, "all_method_results.csv"), index=False)
     summary = summarize_long_results(all_long, include_oracle_gap=True)
     summary.to_csv(os.path.join(out, "summary_results.csv"), index=False)
     save_primary_paper_tables(summary, out)
@@ -1003,14 +1088,15 @@ def run_primary_episodic(tokenizer, metadata_path, bank_df, device, EXPERIMENT_C
 #     evaluation. The same batch is used for adaptation and evaluation.
 #   * Best Single-FT is selected once on stream B1. Static TENT freezes after
 #     its B1 update; online TENT keeps adapting across all domain switches.
+#   * Both candidate orders use the same dynamic/static/TENT protocols.
 #   * Static Hierarchical Routing is solved only on B1 and frozen. Hard, Flat
 #     and ordinary Hierarchical Routing reroute on every incoming batch.
 #   * TENT (Hierarchical Routing) performs its own shorter Hierarchical Routing
 #     optimization on B1, then keeps only its online TENT state through the stream.
 #   * Relative Loss Improvement is computed per batch against Pretrained before
 #     averaging: 100 * (L_pretrained - L_method) / L_pretrained.
-#   * PCA/grid diagnostics are preserved on stream B1 only and are not counted
-#     in Hierarchical Routing runtime.
+#   * Optional PCA/grid uses only the normal/static Current Order solve on B1,
+#     outside routing runtime; never New Order or the short TENT solve.
 
 
 def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, DATASET_REGISTRY):
@@ -1047,14 +1133,14 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
         best_single, best_single_time, scores = select_best_single_ft(bank_df, first_batch, device, EXPERIMENT_CONFIG)
         scores.to_csv(os.path.join(out, "best_single_ft_selection.csv"), index=False)
 
-    static_tent_state = tent_best_state = tent_hier_state = None
-    static_tent_init_time = tent_best_init_time = tent_hier_init_time = 0.0
+    static_tent_state = tent_best_state = None
+    static_tent_init_time = tent_best_init_time = 0.0
     if "static_tent_best_single" in methods:
         static_tent_state, static_tent_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
     if "tent_best_single" in methods:
         tent_best_state, tent_best_init_time = init_tent_from_best_single(best_single, best_single_time, device, EXPERIMENT_CONFIG)
 
-    static_hier_model = None
+    hier_states = {}
     all_wide, all_long = [], []
     try:
         for stream_id, dataset_name in enumerate(sequence):
@@ -1085,63 +1171,28 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
             routing_needed = any(m in methods for m in ["hard", "flat", "hierarchical"]) or (
                 stream_id == 0 and any(m in methods for m in ["static_hierarchical", "tent_hierarchical"])
             )
-            scored = pretrained_loss = scoring_time = None
+            new_order_needed = "new_order_hierarchical" in methods or (
+                stream_id == 0 and any(m in methods for m in ["static_new_order_hierarchical", "tent_new_order_hierarchical"])
+            )
+            scored, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time = None, None, 0.0, 0.0
+            if routing_needed or new_order_needed:
+                pretrained_loss, pretrained_scoring_time = compute_pretrained_routing_loss(batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
             if routing_needed:
-                scored, pretrained_loss, scoring_time = compute_shared_routing_scores(bank_df, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
+                scored, full_bank_scoring_time = compute_shared_routing_scores(bank_df, batch, device)
                 scored.to_csv(os.path.join(batch_dir, "bank_batch_losses.csv"), index=False)
 
             if "hard" in methods:
-                results.append(run_hard(metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
+                results.append(run_hard(metadata_path, bank_df, scored, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY))
             if "flat" in methods:
-                flat_result, flat_info = run_flat(metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
+                flat_result, flat_info = run_flat(metadata_path, bank_df, scored, pretrained_loss, pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY)
                 results.append(flat_result)
                 save_flat_details(batch_dir, flat_info)
 
-            hier_b1_needed = stream_id == 0 and any(m in methods for m in ["hierarchical", "static_hierarchical", "tent_hierarchical"])
-            if hier_b1_needed:
-                hier_model, hier_result, hier_info = build_hierarchical_model(
-                    metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                    EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
-                )
-                if "hierarchical" in methods:
-                    results.append(hier_result)
-                if "tent_hierarchical" in methods:
-                    # TENT has its own B1 HR solve; only bank scores are shared.
-                    tent_hier_model, tent_hier_result, tent_hier_info = build_hierarchical_model(
-                        metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                        EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG, for_tent=True),
-                    )
-                    tent_hier_state, tent_hier_init_time = init_tent_from_model(
-                        tent_hier_model, tent_hier_result["total_time_sec"], device, EXPERIMENT_CONFIG,
-                    )
-                    results.append(run_tent_batch(
-                        tent_hier_state, batch, stream_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)",
-                    ))
-                if "static_hierarchical" in methods:
-                    static_hier_model = hier_model
-                    static_result = copy.deepcopy(hier_result)
-                    static_result["method"] = "Static Hierarchical Routing"
-                    static_result["routing_recomputed"] = True
-                    results.append(static_result)
-                else:
-                    clear_model(hier_model, device)
-                save_hierarchical_details(batch_dir, hier_info)
-                run_pca_diagnostics(hier_info, batch_dir, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY, f"non-stationary stream batch 1 ({dataset_name})")
-            elif stream_id > 0:
-                if "static_hierarchical" in methods:
-                    if static_hier_model is None:
-                        raise RuntimeError("Static Hierarchical model was not initialized on stream batch 1.")
-                    results.append(evaluate_static_hierarchical(static_hier_model, batch, device))
-                if "hierarchical" in methods:
-                    hier_model, hier_result, hier_info = build_hierarchical_model(
-                        metadata_path, bank_df, scored, pretrained_loss, scoring_time, batch, device,
-                        EXPERIMENT_CONFIG, MODEL_REGISTRY, hierarchical_config=get_hierarchical_config(EXPERIMENT_CONFIG),
-                    )
-                    results.append(hier_result)
-                    save_hierarchical_details(batch_dir, hier_info)
-                    clear_model(hier_model, device)
-                if "tent_hierarchical" in methods:
-                    results.append(run_tent_batch(tent_hier_state, batch, stream_id, tent_hier_init_time, device, "TENT (Hierarchical Routing)"))
+            results.extend(run_hierarchical_variants(
+                methods, hier_states, stream_id, metadata_path, bank_df, scored, pretrained_loss,
+                pretrained_scoring_time, full_bank_scoring_time, batch, device, EXPERIMENT_CONFIG, MODEL_REGISTRY,
+                batch_dir, f"non-stationary stream batch 1 ({dataset_name})",
+            ))
 
             add_relative_loss_improvement(results)
             base = build_base_row(EXPERIMENT_CONFIG, MODEL_REGISTRY, "nonstationary_stream", dataset_name, stream_id, offset)
@@ -1155,11 +1206,12 @@ def run_nonstationary_stream(tokenizer, metadata_path, bank_df, device, EXPERIME
                 pd.DataFrame(all_wide).to_csv(os.path.join(out, "nonstationary_batch_results_wide.csv"), index=False)
                 pd.DataFrame(all_long).to_csv(os.path.join(out, "nonstationary_batch_results.csv"), index=False)
     finally:
-        clear_model(static_hier_model, device)
+        clear_hierarchical_states(hier_states, device)
         clear_online_tent(static_tent_state, device)
         clear_online_tent(tent_best_state, device)
-        clear_online_tent(tent_hier_state, device)
 
+    pd.DataFrame(all_wide).to_csv(os.path.join(out, "nonstationary_batch_results_wide.csv"), index=False)
+    pd.DataFrame(all_long).to_csv(os.path.join(out, "nonstationary_batch_results.csv"), index=False)
     summary = summarize_long_results(all_long, group_cols=("method",), include_oracle_gap=False)
     summary.to_csv(os.path.join(out, "summary_results.csv"), index=False)
     save_nonstationary_table(summary, out)

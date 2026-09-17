@@ -33,7 +33,7 @@ MODEL_REGISTRY = {
     "medium": {
         "model_name": "gpt2-medium",
         "bank_prefix": "gpt2Medium",
-        "pretrained_subfolder": None,
+        "pretrained_subfolder": "gpt2-medium/pretrained/model",
         "lambdas": ["0.0", "0.02", "0.05", "0.10", "0.20", "0.50", "0.70", "1.00", "1.50", "2.00"],
     },
     "large": {
@@ -283,6 +283,8 @@ DATASET_REGISTRY = {
 #   be disjoint. No Oracle is used; Relative Loss Improvement vs Pretrained (%)
 #   is computed per batch as 100 * (L_pretrained - L_method) / L_pretrained,
 #   then summarized across batches.
+#   num_online_batches must be divisible by the number of deployment datasets
+#   so that each deployment contributes the same number of batches.
 #
 # In both protocols, B1 is the first batch of the dataset (Primary) or stream:
 #   - TENT (Best Single-FT): select Best Single-FT on B1, then adapt online.
@@ -292,17 +294,16 @@ DATASET_REGISTRY = {
 #   - Normal HR (and Hard/Flat Routing): reroute on every batch.
 #   - TENT (HR): run its own short HR optimization on B1, then apply TENT;
 #     subsequent batches use only online TENT, with no further routing.
-#     tent_hierarchical overrides only num_iters; other HR settings are shared.
-#     Two iterations are chosen to reduce the cost before TENT, not as an optimum.
-#   TENT uses lr=1e-3 and one update per adapted batch. Its B1 deployment time
-#   includes Best Single-FT selection or short HR, loading/initialization as
-#   applicable, and TENT. Later online batches incur only the TENT batch cost.
-#   PCA/grid uses normal HR on B1 of each Primary dataset or B1 of the stream;
-#   diagnostic runtime is excluded from routing runtime.
+#   - New-Order HR variants follow the same dynamic/static/TENT protocols as
+#     current-order HR, changing only the candidate-selection order.
+#   - tent_hierarchical overrides only num_iters for both HR variants;
+#     all other HR settings are shared.
+#   - Five iterations are chosen to reduce the cost before TENT, not as an optimum.
+
 
 EXPERIMENT_1_CONFIG = {
     "experiment_name": "exp1_arxiv_freelaw_pubmedcentral",
-    "model": "small",
+    "model": "small", # "medium",
 
     "sources": [
         "ArXiv",
@@ -313,8 +314,10 @@ EXPERIMENT_1_CONFIG = {
     # Mixed FT must have been trained uniformly on exactly the source set above.
     # routing_test.py verifies the model prefix and source names from this path.
     "mixed_ft": {
+        # Change to the GPT-2 Medium Mixed-FT checkpoint.
         "subfolder": "gpt2-small/Mixed_FT_ArXiv_FreeLaw_PubMed_Central/model",
     },
+
     "deployments": [
         "PG-19",
         "PubMed Abstracts",
@@ -326,16 +329,19 @@ EXPERIMENT_1_CONFIG = {
 
     "hierarchical": {
         "H": 3,
-        "num_iters": 5,
+        "num_iters": 20,
         "lr": 0.1,
         "num_random_starts": 5,
         "dirichlet_concentration": 1.0,
         "seed": 42,
     },
-    "tent_hierarchical": {"num_iters": 2},
+
+    "tent_hierarchical": {"num_iters": 5},
+
     "flat": {
         "tau": 1.0,
     },
+
     "tent": {
         "lr": 1e-3,
         "num_steps": 1,
@@ -343,7 +349,7 @@ EXPERIMENT_1_CONFIG = {
 
     # PCA/grid diagnostics are generated only for the first batch used by
     # normal Hierarchical Routing. Their runtime is not counted as routing time.
-    "run_pca": True,
+    "run_pca": True, # False,
     "progressive_save": True,
     "seed": 42,
 
@@ -362,6 +368,9 @@ EXPERIMENT_1_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
             "oracle",
         ],
     },
@@ -383,15 +392,17 @@ EXPERIMENT_1_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
         ],
     },
 }
 
 
-
 EXPERIMENT_2_CONFIG = {
     "experiment_name": "exp2_github_freelaw_stackexchange_dm",
-    "model": "small",
+    "model": "small", # "medium",
 
     "sources": [
         "GitHub",
@@ -402,8 +413,10 @@ EXPERIMENT_2_CONFIG = {
 
     # Expected Mixed-FT checkpoint for this exact source set.
     "mixed_ft": {
+        # Change to the GPT-2 Medium Mixed-FT checkpoint.
         "subfolder": "gpt2-small/Mixed_FT_GitHub_FreeLaw_StackExchange_DM_Mathematics/model",
     },
+
     "deployments": [
         "PG-19",
         "PubMed Abstracts",
@@ -421,16 +434,19 @@ EXPERIMENT_2_CONFIG = {
         "dirichlet_concentration": 1.0,
         "seed": 42,
     },
-    "tent_hierarchical": {"num_iters": 2},
+
+    "tent_hierarchical": {"num_iters": 5},
+
     "flat": {
         "tau": 1.0,
     },
+
     "tent": {
         "lr": 1e-3,
         "num_steps": 1,
     },
 
-    "run_pca": True,
+    "run_pca": True, # False,
     "progressive_save": True,
     "seed": 42,
 
@@ -449,6 +465,9 @@ EXPERIMENT_2_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
             "oracle",
         ],
     },
@@ -470,13 +489,17 @@ EXPERIMENT_2_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
         ],
     },
 }
 
+
 EXPERIMENT_3_CONFIG = {
     "experiment_name": "exp3_full_bank",
-    "model": "small",
+    "model": "small", # "medium",
 
     "sources": [
         "ArXiv",
@@ -494,8 +517,10 @@ EXPERIMENT_3_CONFIG = {
 
     # Expected Mixed-FT checkpoint for this exact source set.
     "mixed_ft": {
+        # Change to the GPT-2 Medium Mixed-FT checkpoint.
         "subfolder": "gpt2-small/Mixed_FT_ArXiv_DM_Mathematics_EuroParl_FreeLaw_GitHub_PG-19_OWT2_PubMed_Abstracts_PubMed_Central_StackExchange_Wikipedia/model",
     },
+
     "deployments": [
         "Ubuntu IRC",
         "YouTube Subtitles",
@@ -507,22 +532,25 @@ EXPERIMENT_3_CONFIG = {
 
     "hierarchical": {
         "H": 3,
-        "num_iters": 5,
+        "num_iters": 20,
         "lr": 0.1,
         "num_random_starts": 5,
         "dirichlet_concentration": 1.0,
         "seed": 42,
     },
-    "tent_hierarchical": {"num_iters": 2},
+
+    "tent_hierarchical": {"num_iters": 5},
+
     "flat": {
         "tau": 1.0,
     },
+
     "tent": {
         "lr": 1e-3,
         "num_steps": 1,
     },
 
-    "run_pca": True,
+    "run_pca": True, # False,
     "progressive_save": True,
     "seed": 42,
 
@@ -541,6 +569,9 @@ EXPERIMENT_3_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
             "oracle",
         ],
     },
@@ -562,13 +593,17 @@ EXPERIMENT_3_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
         ],
     },
 }
 
+
 EXPERIMENT_4_CONFIG = {
     "experiment_name": "exp4_pubmedcentral_arxiv_pg19",
-    "model": "small",
+    "model": "small", # "medium",
 
     # Three broad source domains chosen to cover scientific/biomedical
     # writing and long-form books.
@@ -577,7 +612,9 @@ EXPERIMENT_4_CONFIG = {
         "ArXiv",
         "PG-19",
     ],
+
     "mixed_ft": {
+        # Change to the GPT-2 Medium Mixed-FT checkpoint.
         "subfolder": "gpt2-small/Mixed_FT_PubMed_Central_ArXiv_PG-19/model",
     },
 
@@ -620,7 +657,7 @@ EXPERIMENT_4_CONFIG = {
 
     # PCA/grid uses normal HR on B1; diagnostic time is excluded
     # from routing deployment time.
-    "run_pca": True,
+    "run_pca": True, # False,
     "progressive_save": True,
     "seed": 42,
 
@@ -631,6 +668,7 @@ EXPERIMENT_4_CONFIG = {
         "methods": [
             "pretrained",
             "best_single_ft",
+            "mixed_ft",
             "static_tent_best_single",
             "tent_best_single",
             "hard",
@@ -638,6 +676,9 @@ EXPERIMENT_4_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
             "oracle",
         ],
     },
@@ -651,6 +692,7 @@ EXPERIMENT_4_CONFIG = {
         "methods": [
             "pretrained",
             "best_single_ft",
+            "mixed_ft",
             "static_tent_best_single",
             "tent_best_single",
             "hard",
@@ -658,6 +700,9 @@ EXPERIMENT_4_CONFIG = {
             "static_hierarchical",
             "hierarchical",
             "tent_hierarchical",
+            "static_new_order_hierarchical",
+            "new_order_hierarchical",
+            "tent_new_order_hierarchical",
         ],
     },
 }
@@ -665,9 +710,9 @@ EXPERIMENT_4_CONFIG = {
 
 # Only configurations listed here are executed, in this exact order.
 EXPERIMENTS = [
-    # EXPERIMENT_1_CONFIG,
-    # EXPERIMENT_2_CONFIG,
-    # EXPERIMENT_3_CONFIG,
+    EXPERIMENT_1_CONFIG,
+    EXPERIMENT_2_CONFIG,
+    EXPERIMENT_3_CONFIG,
     EXPERIMENT_4_CONFIG,
 ]
 

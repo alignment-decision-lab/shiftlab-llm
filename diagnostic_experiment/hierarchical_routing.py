@@ -15,8 +15,7 @@ M = {theta_0} U {theta_{j,lambda}}:
 5. Compose:
        theta_B = sum_k w*_k theta_k.
 
-The routing batch is unchanged. During EG optimization only, its gradient
-is accumulated over micro-batches to reduce peak GPU memory.
+All routing decisions are driven by the incoming-batch language-model loss.
 """
 
 import copy
@@ -41,7 +40,6 @@ DEFAULT_CONFIG = {
     "num_random_starts": 5,
     "dirichlet_concentration": 1.0,
     "flat_tau": 1.0,
-    "microbatch_size": 4,
     "seed": 42,
 }
 
@@ -93,7 +91,7 @@ def compute_bank_batch_losses(bank_df, batch, device, bank_repo_id=None):
         model.eval()
 
         with torch.no_grad():
-            loss = model(**batch, use_cache=False).loss.item()
+            loss = model(**batch).loss.item()
 
         losses.append(float(loss))
         del model
@@ -149,14 +147,21 @@ def select_routing_candidates(source_relevance_df, pretrained_loss, H):
 
     for _, source_row in source_relevance_df.iterrows():
         row = dict(source_row)
-        row.update({"candidate_name": source_row["dataset_name"], "is_pretrained": False})
+        row.update({
+            "candidate_name": source_row["dataset_name"],
+            "is_pretrained": False,
+        })
         rows.append(row)
 
     representatives_df = pd.DataFrame(rows)
     num_candidates = min(H, len(representatives_df))
-    selected_candidates_df = representatives_df.sort_values(
-        "best_loss", ascending=True
-    ).head(num_candidates).reset_index(drop=True)
+
+    selected_candidates_df = (
+        representatives_df
+        .sort_values("best_loss", ascending=True)
+        .head(num_candidates)
+        .reset_index(drop=True)
+    )
 
     return representatives_df, selected_candidates_df
 
@@ -182,8 +187,10 @@ def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, d
             candidate_name = row["dataset_name"]
 
         candidates[candidate_name] = {
-            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            k: v.detach().cpu().clone()
+            for k, v in model.state_dict().items()
         }
+
         del model
 
     return candidates
@@ -194,16 +201,19 @@ def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, d
 # ============================================================
 
 def interpolate_state_dicts(candidate_state_dicts, weights, device):
-    """theta(w) = sum_k w_k theta_k, without stacking candidates on GPU."""
+    """theta(w) = sum_k w_k theta_k, differentiable with respect to weights."""
     names = list(candidate_state_dicts.keys())
     param_keys = candidate_state_dicts[names[0]].keys()
     interpolated = {}
 
     for key in param_keys:
-        value = candidate_state_dicts[names[0]][key].to(device) * weights[0]
-        for i, name in enumerate(names[1:], start=1):
-            value = value + candidate_state_dicts[name][key].to(device) * weights[i]
-        interpolated[key] = value
+        stacked = torch.stack(
+            [candidate_state_dicts[name][key].to(device) for name in names],
+            dim=0,
+        )
+
+        w = weights.view(-1, *([1] * (stacked.dim() - 1)))
+        interpolated[key] = (w * stacked).sum(dim=0)
 
     return interpolated
 
@@ -211,50 +221,8 @@ def interpolate_state_dicts(candidate_state_dicts, weights, device):
 def batch_loss_at_weights(model_template, candidate_state_dicts, weights, batch, device):
     """Forward pass of theta(w) on incoming batch B."""
     params = interpolate_state_dicts(candidate_state_dicts, weights, device)
-    kwargs = dict(batch)
-    kwargs["use_cache"] = False
-    outputs = functional_call(model_template, params, args=(), kwargs=kwargs, tie_weights=False)
+    outputs = functional_call(model_template, params, args=(), kwargs=batch, tie_weights=False)
     return outputs.loss
-
-
-def get_batch_size(batch):
-    """Infer the number of sequences in a tokenized batch."""
-    for value in batch.values():
-        if torch.is_tensor(value) and value.ndim > 0:
-            return value.shape[0]
-    raise ValueError("Could not infer batch size.")
-
-
-def slice_batch(batch, start, end):
-    """Slice tensor-valued batch entries along the sequence dimension."""
-    return {
-        key: value[start:end] if torch.is_tensor(value) and value.ndim > 0 else value
-        for key, value in batch.items()
-    }
-
-
-def microbatch_weight(microbatch, full_batch_size):
-    """Weight a micro-batch so accumulated losses reproduce the full-batch mean."""
-    return get_batch_size(microbatch) / full_batch_size
-
-
-def batch_loss_and_grad_at_weights(model_template, candidate_state_dicts, weights, batch, device, microbatch_size):
-    """Compute full-batch loss and dL/dw while freeing each micro-batch graph immediately."""
-    batch_size = get_batch_size(batch)
-    microbatch_size = min(max(1, int(microbatch_size)), batch_size)
-    total_loss = 0.0
-    total_grad = torch.zeros_like(weights)
-
-    for start in range(0, batch_size, microbatch_size):
-        microbatch = slice_batch(batch, start, min(start + microbatch_size, batch_size))
-        weight = microbatch_weight(microbatch, batch_size)
-        loss = batch_loss_at_weights(model_template, candidate_state_dicts, weights, microbatch, device)
-        grad = torch.autograd.grad(loss, weights, retain_graph=False, create_graph=False)[0]
-        total_loss += weight * float(loss.detach().item())
-        total_grad.add_(grad.detach(), alpha=weight)
-        del loss, grad
-
-    return total_loss, total_grad
 
 
 def exponentiated_gradient_step(weights, grad, lr):
@@ -268,17 +236,19 @@ def exponentiated_gradient_step(weights, grad, lr):
 # WEIGHT OPTIMIZATION
 # ============================================================
 
-def optimize_weights(model_template, candidate_state_dicts, batch, device, init_weights, num_iters, lr, microbatch_size=4):
-    """Run exponentiated gradient from one initialization using micro-batch accumulation."""
+def optimize_weights(model_template, candidate_state_dicts, batch, device, init_weights, num_iters, lr):
+    """Run exponentiated gradient from one initialization."""
     weights = init_weights.clone().to(device)
-    best_weights, best_loss, best_iteration = None, float("inf"), None
+
+    best_weights = None
+    best_loss = float("inf")
+    best_iteration = None
     trajectory = []
 
     for iteration in range(num_iters):
         weights = weights.detach().requires_grad_(True)
-        current_loss, grad = batch_loss_and_grad_at_weights(
-            model_template, candidate_state_dicts, weights, batch, device, microbatch_size
-        )
+        loss = batch_loss_at_weights(model_template, candidate_state_dicts, weights, batch, device)
+        current_loss = float(loss.item())
 
         trajectory.append({
             "iteration": iteration,
@@ -287,14 +257,24 @@ def optimize_weights(model_template, candidate_state_dicts, batch, device, init_
         })
 
         if current_loss < best_loss:
-            best_loss, best_weights, best_iteration = current_loss, weights.detach().clone(), iteration
+            best_loss = current_loss
+            best_weights = weights.detach().clone()
+            best_iteration = iteration
 
+        loss.backward()
+        grad = weights.grad.detach()
         weights = exponentiated_gradient_step(weights.detach(), grad, lr)
 
     with torch.no_grad():
-        final_loss = float(batch_loss_at_weights(
-            model_template, candidate_state_dicts, weights, batch, device
-        ).item())
+        final_loss = float(
+            batch_loss_at_weights(
+                model_template,
+                candidate_state_dicts,
+                weights,
+                batch,
+                device,
+            ).item()
+        )
 
     trajectory.append({
         "iteration": num_iters,
@@ -303,7 +283,9 @@ def optimize_weights(model_template, candidate_state_dicts, batch, device, init_
     })
 
     if final_loss < best_loss:
-        best_loss, best_weights, best_iteration = final_loss, weights.detach().clone(), num_iters
+        best_loss = final_loss
+        best_weights = weights.detach().clone()
+        best_iteration = num_iters
 
     return best_weights, best_loss, best_iteration, trajectory
 
@@ -319,37 +301,55 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
         for i in range(K):
             vertex = torch.zeros(K, device=device)
             vertex[i] = 1.0
+
             loss = batch_loss_at_weights(
-                model_template, candidate_state_dicts, vertex, batch, device
+                model_template,
+                candidate_state_dicts,
+                vertex,
+                batch,
+                device,
             ).item()
+
             vertex_losses.append(float(loss))
 
     starts = [torch.full((K,), 1.0 / K)]
     start_names = ["uniform"]
 
     flat_tau = config.get("flat_tau", DEFAULT_CONFIG["flat_tau"])
-    starts.append(F.softmax(
-        -torch.tensor(vertex_losses, dtype=torch.float32) / flat_tau, dim=0
-    ))
+    starts.append(
+        F.softmax(
+            -torch.tensor(vertex_losses, dtype=torch.float32) / flat_tau,
+            dim=0,
+        )
+    )
     start_names.append("flat_soft")
 
     R = config.get("num_random_starts", DEFAULT_CONFIG["num_random_starts"])
-    concentration = config.get("dirichlet_concentration", DEFAULT_CONFIG["dirichlet_concentration"])
+    concentration = config.get(
+        "dirichlet_concentration",
+        DEFAULT_CONFIG["dirichlet_concentration"],
+    )
     seed = config.get("seed", DEFAULT_CONFIG["seed"])
-    dirichlet = torch.distributions.Dirichlet(torch.full((K,), concentration))
+
+    dirichlet = torch.distributions.Dirichlet(
+        torch.full((K,), concentration)
+    )
 
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
+
         for random_id in range(R):
             starts.append(dirichlet.sample())
             start_names.append(f"random_{random_id + 1}")
 
     num_iters = config.get("num_iters", DEFAULT_CONFIG["num_iters"])
     lr = config.get("lr", DEFAULT_CONFIG["lr"])
-    microbatch_size = config.get("microbatch_size", DEFAULT_CONFIG["microbatch_size"])
 
-    best_weights, best_loss = None, float("inf")
-    best_start_id, best_start_name, best_iteration = None, None, None
+    best_weights = None
+    best_loss = float("inf")
+    best_start_id = None
+    best_start_name = None
+    best_iteration = None
     all_trajectories = []
 
     for start_id, (start_name, start) in enumerate(zip(start_names, starts)):
@@ -361,7 +361,6 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
             init_weights=start,
             num_iters=num_iters,
             lr=lr,
-            microbatch_size=microbatch_size,
         )
 
         for point in trajectory:
@@ -371,18 +370,27 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
         all_trajectories.extend(trajectory)
 
         if loss < best_loss:
-            best_weights, best_loss = weights, loss
-            best_start_id, best_start_name, best_iteration = start_id, start_name, best_iter
+            best_weights = weights
+            best_loss = loss
+            best_start_id = start_id
+            best_start_name = start_name
+            best_iteration = best_iter
 
-    best_is_vertex, best_vertex_name = False, None
+    best_is_vertex = False
+    best_vertex_name = None
 
     for i, vertex_loss in enumerate(vertex_losses):
         if vertex_loss < best_loss:
             vertex = torch.zeros(K, device=device)
             vertex[i] = 1.0
-            best_weights, best_loss = vertex, vertex_loss
-            best_start_id, best_start_name, best_iteration = None, None, None
-            best_is_vertex, best_vertex_name = True, names[i]
+
+            best_weights = vertex
+            best_loss = vertex_loss
+            best_start_id = None
+            best_start_name = None
+            best_iteration = None
+            best_is_vertex = True
+            best_vertex_name = names[i]
 
     return {
         "best_weights": best_weights,
@@ -404,11 +412,16 @@ def multi_start_optimize(model_template, candidate_state_dicts, batch, device, c
 def compose_model(model_template, candidate_state_dicts, weights, device):
     """Materialize theta_B = sum_k w*_k theta_k."""
     with torch.no_grad():
-        params = interpolate_state_dicts(candidate_state_dicts, weights, device)
+        params = interpolate_state_dicts(
+            candidate_state_dicts,
+            weights,
+            device,
+        )
 
     model = copy.deepcopy(model_template).to(device)
     model.load_state_dict(params)
     model.eval()
+
     return model
 
 
@@ -438,8 +451,11 @@ def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_n
         )
 
     source_relevance_df = compute_source_relevance(scored_bank_df)
+
     representatives_df, selected_candidates_df = select_routing_candidates(
-        source_relevance_df, pretrained_loss, config["H"]
+        source_relevance_df,
+        pretrained_loss,
+        config["H"],
     )
 
     candidate_state_dicts = build_candidate_state_dicts(
@@ -456,21 +472,38 @@ def run_hierarchical_routing(model_bank_metadata_path, batch, pretrained_model_n
         pretrained_subfolder=pretrained_subfolder,
         bank_repo_id=bank_repo_id,
     )
-    model_template.config.use_cache = False
 
     optimization_info = multi_start_optimize(
-        model_template, candidate_state_dicts, batch, device, config
+        model_template,
+        candidate_state_dicts,
+        batch,
+        device,
+        config,
     )
 
     best_weights = optimization_info["best_weights"]
-    theta_B = compose_model(model_template, candidate_state_dicts, best_weights, device)
+
+    theta_B = compose_model(
+        model_template,
+        candidate_state_dicts,
+        best_weights,
+        device,
+    )
 
     names = list(candidate_state_dicts.keys())
-    selected_ft_df = selected_candidates_df[selected_candidates_df["is_pretrained"] == False]
+
+    selected_ft_df = selected_candidates_df[
+        selected_candidates_df["is_pretrained"] == False
+    ]
 
     info = {
         "candidate_names": names,
-        "weights": dict(zip(names, best_weights.detach().cpu().tolist())),
+        "weights": dict(
+            zip(
+                names,
+                best_weights.detach().cpu().tolist(),
+            )
+        ),
         "batch_loss": float(optimization_info["best_loss"]),
         "vertex_losses": optimization_info["vertex_losses"],
         "pretrained_loss": float(pretrained_loss),
@@ -510,9 +543,12 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained-subfolder", default=None)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
     print(
         "This module exposes run_hierarchical_routing("
-        "model_bank_metadata_path, batch, pretrained_model_name, device, config, ...)."
+        "model_bank_metadata_path, batch, pretrained_model_name, "
+        "device, config, ...)."
     )

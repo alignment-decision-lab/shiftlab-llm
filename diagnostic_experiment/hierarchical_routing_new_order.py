@@ -1,40 +1,28 @@
 """Hierarchical Routing with source-first ERM screening.
 
-Given an incoming unlabeled batch B and a model bank
+Given an incoming batch B and a model bank
 M = {theta_0} U {theta_{j,lambda}}:
 
 1. Score theta_0 and the standard ERM checkpoint theta_{j,0} of every source.
-2. Keep the H candidates with the smallest incoming-batch loss among:
-       {theta_0} U {theta_{j,0}}.
+2. Keep the H candidates with the smallest incoming-batch loss among
+   {theta_0} U {theta_{j,0}}.
 3. For each selected fine-tuned source j, score all its lambda checkpoints:
        lambda*_j(B) = argmin_lambda L_hat_B(theta_{j,lambda}).
    If theta_0 was selected at Step 2, it remains unchanged.
-4. Build C_B from theta_0 when selected and the lambda*_j(B) checkpoint of
-   every selected source.
-5. Optimize interpolation weights w over the simplex Delta(C_B) via
-   exponentiated-gradient descent, from several starting points, and compare
-   against every simplex vertex.
-6. Compose:
-       theta_B = sum_k w*_k theta_k.
+4. Replace each selected source ERM representative by theta_{j,lambda*_j}.
+5. Run the exact same simplex EG optimization as hierarchical_routing.py.
+6. Compose theta_B = sum_k w*_k theta_k.
 
 Relative to hierarchical_routing.py, only the candidate-selection order changes.
-The routing batch is unchanged; EG gradients are accumulated over micro-batches
-only to reduce peak GPU memory.
 """
 
-import copy
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+import hierarchical_routing as hr
 from algorithm_2 import load_model_bank_metadata
 from utils import move_batch_to_device
-
-try:
-    from torch.func import functional_call
-except ImportError:
-    from torch.nn.utils.stateless import functional_call
 
 
 DEFAULT_CONFIG = {
@@ -44,7 +32,6 @@ DEFAULT_CONFIG = {
     "num_random_starts": 5,
     "dirichlet_concentration": 1.0,
     "flat_tau": 1.0,
-    "microbatch_size": 4,
     "seed": 42,
 }
 
@@ -84,7 +71,7 @@ def filter_trained_rows(bank_df):
 
 
 # ============================================================
-# ERM SCREENING
+# STEP 1-2: ERM SCREENING
 # ============================================================
 
 def select_erm_representatives(bank_df):
@@ -118,7 +105,7 @@ def compute_checkpoint_batch_losses(bank_df, batch, device, bank_repo_id=None):
         model.eval()
 
         with torch.no_grad():
-            loss = model(**batch, use_cache=False).loss.item()
+            loss = model(**batch).loss.item()
 
         losses.append(float(loss))
         del model
@@ -148,19 +135,20 @@ def select_top_h_erm_candidates(scored_erm_df, pretrained_loss, H):
 
     screening_candidates_df = pd.DataFrame(rows)
     num_candidates = min(H, len(screening_candidates_df))
-    selected_screening_df = screening_candidates_df.sort_values(
-        "batch_loss"
-    ).head(num_candidates).reset_index(drop=True)
-
+    selected_screening_df = (
+        screening_candidates_df.sort_values("batch_loss")
+        .head(num_candidates)
+        .reset_index(drop=True)
+    )
     return screening_candidates_df, selected_screening_df
 
 
 # ============================================================
-# SELECTED-SOURCE LAMBDA SCORING
+# STEP 3: SELECTED-SOURCE LAMBDA SCORING
 # ============================================================
 
 def score_selected_source_banks(bank_df, selected_sources, scored_erm_df, batch, device, bank_repo_id=None):
-    """Score all lambdas only for selected sources, reusing their ERM losses."""
+    """Score all lambdas only for selected sources, reusing their lambda=0 losses."""
     selected_bank_df = bank_df[bank_df["dataset_name"].isin(selected_sources)].copy()
     erm_losses = {
         row["dataset_name"]: float(row["batch_loss"])
@@ -179,7 +167,7 @@ def score_selected_source_banks(bank_df, selected_sources, scored_erm_df, batch,
         model.eval()
 
         with torch.no_grad():
-            loss = model(**batch, use_cache=False).loss.item()
+            loss = model(**batch).loss.item()
 
         losses.append(float(loss))
         del model
@@ -211,6 +199,10 @@ def compute_source_relevance(scored_bank_df):
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# STEP 4: FINAL CANDIDATES
+# ============================================================
+
 def build_final_candidates(selected_screening_df, source_relevance_df, pretrained_loss):
     """Replace each selected ERM representative by its source-optimal lambda*_j."""
     rows = []
@@ -228,10 +220,14 @@ def build_final_candidates(selected_screening_df, source_relevance_df, pretraine
             continue
 
         dataset_name = selected_row["dataset_name"]
-        source_row = source_relevance_df[source_relevance_df["dataset_name"] == dataset_name]
+        source_row = source_relevance_df[
+            source_relevance_df["dataset_name"] == dataset_name
+        ]
 
         if source_row.empty:
-            raise ValueError(f"No lambda scoring result found for selected source {dataset_name!r}.")
+            raise ValueError(
+                f"No lambda scoring result found for selected source {dataset_name!r}."
+            )
 
         row = dict(source_row.iloc[0])
         row.update({"candidate_name": dataset_name, "is_pretrained": False})
@@ -241,11 +237,12 @@ def build_final_candidates(selected_screening_df, source_relevance_df, pretraine
 
 
 # ============================================================
-# CANDIDATE STATE DICTS
+# FINAL CANDIDATE STATE DICTS
 # ============================================================
 
-def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, device, bank_repo_id=None, pretrained_subfolder=None):
-    """Load only final selected candidates as CPU state dictionaries."""
+def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, device,
+                                bank_repo_id=None, pretrained_subfolder=None):
+    """Load only the final H candidates as CPU state dictionaries."""
     candidates = {}
 
     for _, row in selected_candidates_df.iterrows():
@@ -269,234 +266,14 @@ def build_candidate_state_dicts(selected_candidates_df, pretrained_model_name, d
 
 
 # ============================================================
-# DIFFERENTIABLE INTERPOLATION
-# ============================================================
-
-def interpolate_state_dicts(candidate_state_dicts, weights, device):
-    """theta(w) = sum_k w_k theta_k, without stacking candidates on GPU."""
-    names = list(candidate_state_dicts.keys())
-    param_keys = candidate_state_dicts[names[0]].keys()
-    interpolated = {}
-
-    for key in param_keys:
-        value = candidate_state_dicts[names[0]][key].to(device) * weights[0]
-        for i, name in enumerate(names[1:], start=1):
-            value = value + candidate_state_dicts[name][key].to(device) * weights[i]
-        interpolated[key] = value
-
-    return interpolated
-
-
-def batch_loss_at_weights(model_template, candidate_state_dicts, weights, batch, device):
-    """Forward pass of theta(w) on incoming batch B."""
-    params = interpolate_state_dicts(candidate_state_dicts, weights, device)
-    kwargs = dict(batch)
-    kwargs["use_cache"] = False
-    outputs = functional_call(model_template, params, args=(), kwargs=kwargs, tie_weights=False)
-    return outputs.loss
-
-
-def get_batch_size(batch):
-    """Infer the number of sequences in a tokenized batch."""
-    for value in batch.values():
-        if torch.is_tensor(value) and value.ndim > 0:
-            return value.shape[0]
-    raise ValueError("Could not infer batch size.")
-
-
-def slice_batch(batch, start, end):
-    """Slice tensor-valued batch entries along the sequence dimension."""
-    return {
-        key: value[start:end] if torch.is_tensor(value) and value.ndim > 0 else value
-        for key, value in batch.items()
-    }
-
-
-def microbatch_weight(microbatch, full_batch_size):
-    """Weight a micro-batch so accumulated losses reproduce the full-batch mean."""
-    return get_batch_size(microbatch) / full_batch_size
-
-
-def batch_loss_and_grad_at_weights(model_template, candidate_state_dicts, weights, batch, device, microbatch_size):
-    """Compute full-batch loss and dL/dw while freeing each micro-batch graph immediately."""
-    batch_size = get_batch_size(batch)
-    microbatch_size = min(max(1, int(microbatch_size)), batch_size)
-    total_loss = 0.0
-    total_grad = torch.zeros_like(weights)
-
-    for start in range(0, batch_size, microbatch_size):
-        microbatch = slice_batch(batch, start, min(start + microbatch_size, batch_size))
-        weight = microbatch_weight(microbatch, batch_size)
-        loss = batch_loss_at_weights(model_template, candidate_state_dicts, weights, microbatch, device)
-        grad = torch.autograd.grad(loss, weights, retain_graph=False, create_graph=False)[0]
-        total_loss += weight * float(loss.detach().item())
-        total_grad.add_(grad.detach(), alpha=weight)
-        del loss, grad
-
-    return total_loss, total_grad
-
-
-def exponentiated_gradient_step(weights, grad, lr):
-    """w_k <- w_k exp(-lr g_k) / sum_r w_r exp(-lr g_r)."""
-    with torch.no_grad():
-        scaled = weights * torch.exp(-lr * grad)
-        return scaled / scaled.sum()
-
-
-# ============================================================
-# WEIGHT OPTIMIZATION
-# ============================================================
-
-def optimize_weights(model_template, candidate_state_dicts, batch, device, init_weights, num_iters, lr, microbatch_size=4):
-    """Run exponentiated gradient from one initialization using micro-batch accumulation."""
-    weights = init_weights.clone().to(device)
-    best_weights, best_loss, best_iteration = None, float("inf"), None
-    trajectory = []
-
-    for iteration in range(num_iters):
-        weights = weights.detach().requires_grad_(True)
-        current_loss, grad = batch_loss_and_grad_at_weights(
-            model_template, candidate_state_dicts, weights, batch, device, microbatch_size
-        )
-
-        trajectory.append({
-            "iteration": iteration,
-            "loss": current_loss,
-            "weights": weights.detach().cpu().tolist(),
-        })
-
-        if current_loss < best_loss:
-            best_loss, best_weights, best_iteration = current_loss, weights.detach().clone(), iteration
-
-        weights = exponentiated_gradient_step(weights.detach(), grad, lr)
-
-    with torch.no_grad():
-        final_loss = float(batch_loss_at_weights(
-            model_template, candidate_state_dicts, weights, batch, device
-        ).item())
-
-    trajectory.append({
-        "iteration": num_iters,
-        "loss": final_loss,
-        "weights": weights.detach().cpu().tolist(),
-    })
-
-    if final_loss < best_loss:
-        best_loss, best_weights, best_iteration = final_loss, weights.detach().clone(), num_iters
-
-    return best_weights, best_loss, best_iteration, trajectory
-
-
-def multi_start_optimize(model_template, candidate_state_dicts, batch, device, config):
-    """Run EG from multiple starts and compare against every simplex vertex."""
-    names = list(candidate_state_dicts.keys())
-    K = len(names)
-
-    with torch.no_grad():
-        vertex_losses = []
-
-        for i in range(K):
-            vertex = torch.zeros(K, device=device)
-            vertex[i] = 1.0
-            loss = batch_loss_at_weights(
-                model_template, candidate_state_dicts, vertex, batch, device
-            ).item()
-            vertex_losses.append(float(loss))
-
-    starts = [torch.full((K,), 1.0 / K)]
-    start_names = ["uniform"]
-
-    flat_tau = config.get("flat_tau", DEFAULT_CONFIG["flat_tau"])
-    starts.append(F.softmax(
-        -torch.tensor(vertex_losses, dtype=torch.float32) / flat_tau, dim=0
-    ))
-    start_names.append("flat_soft")
-
-    R = config.get("num_random_starts", DEFAULT_CONFIG["num_random_starts"])
-    concentration = config.get("dirichlet_concentration", DEFAULT_CONFIG["dirichlet_concentration"])
-    seed = config.get("seed", DEFAULT_CONFIG["seed"])
-    dirichlet = torch.distributions.Dirichlet(torch.full((K,), concentration))
-
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        for random_id in range(R):
-            starts.append(dirichlet.sample())
-            start_names.append(f"random_{random_id + 1}")
-
-    num_iters = config.get("num_iters", DEFAULT_CONFIG["num_iters"])
-    lr = config.get("lr", DEFAULT_CONFIG["lr"])
-    microbatch_size = config.get("microbatch_size", DEFAULT_CONFIG["microbatch_size"])
-
-    best_weights, best_loss = None, float("inf")
-    best_start_id, best_start_name, best_iteration = None, None, None
-    all_trajectories = []
-
-    for start_id, (start_name, start) in enumerate(zip(start_names, starts)):
-        weights, loss, best_iter, trajectory = optimize_weights(
-            model_template=model_template,
-            candidate_state_dicts=candidate_state_dicts,
-            batch=batch,
-            device=device,
-            init_weights=start,
-            num_iters=num_iters,
-            lr=lr,
-            microbatch_size=microbatch_size,
-        )
-
-        for point in trajectory:
-            point["start_id"] = start_id
-            point["start_name"] = start_name
-
-        all_trajectories.extend(trajectory)
-
-        if loss < best_loss:
-            best_weights, best_loss = weights, loss
-            best_start_id, best_start_name, best_iteration = start_id, start_name, best_iter
-
-    best_is_vertex, best_vertex_name = False, None
-
-    for i, vertex_loss in enumerate(vertex_losses):
-        if vertex_loss < best_loss:
-            vertex = torch.zeros(K, device=device)
-            vertex[i] = 1.0
-            best_weights, best_loss = vertex, vertex_loss
-            best_start_id, best_start_name, best_iteration = None, None, None
-            best_is_vertex, best_vertex_name = True, names[i]
-
-    return {
-        "best_weights": best_weights,
-        "best_loss": best_loss,
-        "best_start_id": best_start_id,
-        "best_start_name": best_start_name,
-        "best_iteration": best_iteration,
-        "best_is_vertex": best_is_vertex,
-        "best_vertex_name": best_vertex_name,
-        "vertex_losses": dict(zip(names, vertex_losses)),
-        "trajectories": all_trajectories,
-    }
-
-
-# ============================================================
-# MODEL COMPOSITION
-# ============================================================
-
-def compose_model(model_template, candidate_state_dicts, weights, device):
-    """Materialize theta_B = sum_k w*_k theta_k."""
-    with torch.no_grad():
-        params = interpolate_state_dicts(candidate_state_dicts, weights, device)
-
-    model = copy.deepcopy(model_template).to(device)
-    model.load_state_dict(params)
-    model.eval()
-    return model
-
-
-# ============================================================
 # HIERARCHICAL ROUTING — NEW ORDER
 # ============================================================
 
-def run_hierarchical_routing_new_order(model_bank_metadata_path, batch, pretrained_model_name, device, config=None, bank_repo_id=None, bank_df=None, pretrained_loss=None, pretrained_subfolder=None):
-    """Run ERM-screened Hierarchical Routing and return theta_B plus routing information."""
+def run_hierarchical_routing_new_order(model_bank_metadata_path, batch,
+                                       pretrained_model_name, device, config=None,
+                                       bank_repo_id=None, bank_df=None,
+                                       pretrained_loss=None, pretrained_subfolder=None):
+    """Run ERM-screened Hierarchical Routing using the original shared EG engine."""
     config = {**DEFAULT_CONFIG, **(config or {})}
     batch = move_batch_to_device(batch, device)
 
@@ -510,20 +287,21 @@ def run_hierarchical_routing_new_order(model_bank_metadata_path, batch, pretrain
             "theta_0 batch loss through pretrained_loss."
         )
 
-    # Step 1: score theta_{j,0} for every source; theta_0 is already scored.
+    # Step 1: score lambda=0.0 for every source; theta_0 is already scored.
     erm_df = select_erm_representatives(bank_df)
-    scored_erm_df = compute_checkpoint_batch_losses(erm_df, batch, device, bank_repo_id)
+    scored_erm_df = compute_checkpoint_batch_losses(
+        erm_df, batch, device, bank_repo_id
+    )
 
     # Step 2: Top-H among theta_0 and all source ERM representatives.
     screening_candidates_df, selected_screening_df = select_top_h_erm_candidates(
         scored_erm_df, pretrained_loss, config["H"]
     )
-
     selected_sources = selected_screening_df.loc[
         selected_screening_df["is_pretrained"] == False, "dataset_name"
     ].tolist()
 
-    # Step 3: score every lambda only for fine-tuned sources surviving Top-H.
+    # Step 3: score all lambdas only for fine-tuned sources surviving Top-H.
     if selected_sources:
         scored_selected_bank_df = score_selected_source_banks(
             bank_df, selected_sources, scored_erm_df, batch, device, bank_repo_id
@@ -533,11 +311,10 @@ def run_hierarchical_routing_new_order(model_bank_metadata_path, batch, pretrain
         scored_selected_bank_df = pd.DataFrame()
         source_relevance_df = pd.DataFrame()
 
-    # Step 4: replace selected ERM representatives by their lambda*_j checkpoints.
+    # Step 4: replace each selected ERM representative by theta_{j,lambda*_j}.
     selected_candidates_df = build_final_candidates(
         selected_screening_df, source_relevance_df, pretrained_loss
     )
-
     candidate_state_dicts = build_candidate_state_dicts(
         selected_candidates_df=selected_candidates_df,
         pretrained_model_name=pretrained_model_name,
@@ -552,18 +329,22 @@ def run_hierarchical_routing_new_order(model_bank_metadata_path, batch, pretrain
         pretrained_subfolder=pretrained_subfolder,
         bank_repo_id=bank_repo_id,
     )
-    model_template.config.use_cache = False
 
-    # Step 5: same simplex optimization as current-order Hierarchical Routing.
-    optimization_info = multi_start_optimize(
+    # Step 5: exact same simplex EG engine as current-order Hierarchical Routing.
+    optimization_info = hr.multi_start_optimize(
         model_template, candidate_state_dicts, batch, device, config
     )
 
+    # Step 6: compose the routed model with the same implementation as Current.
     best_weights = optimization_info["best_weights"]
-    theta_B = compose_model(model_template, candidate_state_dicts, best_weights, device)
+    theta_B = hr.compose_model(
+        model_template, candidate_state_dicts, best_weights, device
+    )
 
     names = list(candidate_state_dicts.keys())
-    selected_ft_df = selected_candidates_df[selected_candidates_df["is_pretrained"] == False]
+    selected_ft_df = selected_candidates_df[
+        selected_candidates_df["is_pretrained"] == False
+    ]
 
     info = {
         "candidate_names": names,
@@ -594,9 +375,7 @@ def run_hierarchical_routing_new_order(model_bank_metadata_path, batch, pretrain
         "config": config,
     }
 
-    del model_template
-    del candidate_state_dicts
-
+    del model_template, candidate_state_dicts
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -614,7 +393,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     print(
         "This module exposes run_hierarchical_routing_new_order("
         "model_bank_metadata_path, batch, pretrained_model_name, device, config, ...)."
